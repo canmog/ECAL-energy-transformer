@@ -1,0 +1,35 @@
+#!/bin/bash
+#SBATCH --job-name=tf_evalnb
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=24G
+#SBATCH --time=01:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+# Lightweight: re-evaluate v2 best (v2cham best.pt) and v1 best (sw_d192 best.pt) on the
+# SAME cache_full10 test split with the NEW binning (extra high-E bin: 2000-3000, 3000-4000)
+# -> metrics with per-bin robust (res) AND raw-std (res_raw) for the method-comparison fig.
+# Architecture matches both (plain head, bypass on, 11 concepts, d192), so one config evals both.
+cd "$SLURM_SUBMIT_DIR" || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+set -o pipefail
+CFG=config/base.yaml
+C=/aifs/user/data/lishanglin/chenhao/transformer/cache_full10
+NB=eval.energy_bins=[0,10,20,50,100,150,200,300,500,1000,2000,3000,4000]
+O=runs/methodfig
+mkdir -p $O
+echo "##### START $(hostname) $(date '+%F %T') #####"
+# v2 best = v2cham composite champion
+if python evaluate.py --config $CFG --ckpt runs/v2cham_d192/best.pt \
+     --set paths.cache_dir=$C paths.out_dir=$O train.num_workers=2 "$NB" 2>&1 | tee $O/eval_v2cham_nb.log | tail -4; then
+  mv -f $O/metrics.json $O/v2cham_nb.json && echo "wrote v2cham_nb.json"
+fi
+# v1 best = sw_d192 (same architecture; load its checkpoint into this config)
+if python evaluate.py --config $CFG --ckpt /aifs/user/data/lishanglin/chenhao/transformer/runs/sw_d192/best.pt \
+     --set paths.cache_dir=$C paths.out_dir=$O train.num_workers=2 "$NB" 2>&1 | tee $O/eval_sw_d192_nb.log | tail -4; then
+  mv -f $O/metrics.json $O/sw_d192_nb.json && echo "wrote sw_d192_nb.json"
+fi
+echo "##### EVALNB_DONE $(date '+%F %T') #####"

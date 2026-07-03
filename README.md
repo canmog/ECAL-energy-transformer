@@ -1,106 +1,36 @@
-# transformer_v2/ — clean `sw_d192` baseline (foundation for the next step)
+# transformer_v2cham/ — champion: wdx + v2m1 + v2b framework
 
-A **clean reproduction of the `sw_d192` baseline** — the best ECAL energy-resolution
-result obtained so far on the complete AMS-02 dataset. This directory exists to be a
-tidy, known-good starting point: nothing from the regressed `dual_v1` experiment line
-is active, so the next idea is built on top of the configuration that actually wins.
+Stacks the two proven, **orthogonal** wins on the `sw_d192` model and runs them inside the
+`v2b` selection framework, so a single run produces the best checkpoint on each axis:
 
-See `../transformerReport/report.tex` (and `report.pdf`) for the full study. The model,
-physics rationale, geometry, and probes are documented in `../transformer/README.md`;
-this file only covers what is specific to `transformer_v2`.
+| ingredient | from | effect |
+|------------|------|--------|
+| `wd_exclude_1d: true` | wdx | exclude 1-D params (LayerNorm/bias/AttnPool-query) from weight decay → best robust core + calibration |
+| `loss.fit_quality_weight` | v2m1 | down-weight concept+recon on poorly-fit events (token-level residual) → suppresses the raw-std tail |
+| `train.select_metric` + multi-best ckpts | v2b | composite selection (`tail_weight=0` here) + saves `best.pt` / `best_robust.pt` / `best_raw.pt` |
 
-## What "the `sw_d192` baseline" is
+## Why this should be the new best
 
-`sw_d192` on the complete 50-file dataset (strict cache, `cache_full10`):
+- `wdx+v2m1` already gave the best robust core (1.38% ≤2 TeV) and best calibration; here it
+  also gets a **raw-selected checkpoint** for the tail, for free, from the same run.
+- On raw-std being noisy: rather than tuning a `tail_weight`, we rely on **multi-best** —
+  `best_raw.pt` is the lightest-tail epoch of the best model. (Optional later A/B:
+  `select_metric.tail_term=excess, tail_weight≈0.3`.)
 
-```
-bin-averaged sigma/E :  5.97 %  (full range)     5.62 %  (E <= 2 TeV)
-robust-core sigma    :  1.36 %  (IQR/1.349, E <= 2 TeV)
-overall sigma/E      :  6.52 %      bias -1.37 %      d_model = 192
-```
+## Pick the checkpoint per metric
 
-It matches the single-file baseline on the **complete** data and is markedly better at
-TeV (3 TeV bin 8.8 % vs the broken 18.4 %). Concepts are learned at R² ≈ 0.95–1.00 for
-the energy-relevant set. Per the report, **no variant has beaten it**: the later
-`dual_v1` "new stack" (NormalizedWeighter + 2 TeV rolloff + 7-concept trim, dual head,
-bypass-off) cost ~+1.66 % binned σ/E, outweighing every architecture/anchor gain. Hence
-this reset.
+- `best_robust.pt` → robust core (expected ~1.38% ≤2 TeV);
+- `best_raw.pt`    → raw-std tail (lightest-tail epoch of this model);
+- `best.pt`        → bias-aware robust composite (drives early stop).
 
-## The config (`config/base.yaml`) = `sw_d192`, exactly
+`job_v2cham.sub` trains once then evaluates all three into `metrics_<ck>.json`.
 
-The code here is the same `dual_v1` build as `../transformer/`, but **every new-stack
-knob is config-gated back to the pre-`dual_v1` behaviour**, reproducing `sw_d192`:
-
-| knob | `sw_d192` (here) | `dual_v1` (off here) |
-|------|------------------|----------------------|
-| `model.dual_energy_head` | `false` — plain energy head | `true` — `e_phys + e_free` |
-| `model.bottleneck_residual` | `true` — `tokens +` skip ON | `false` — bypass removed |
-| `data.concept_use` | *(absent)* — all **11** concepts | 7-concept trim |
-| `loss.weighting` | *(absent)* → **Kendall–Gal** (`uncertainty`) | `normalized` (fixed aux 0.3) |
-| `loss.energy_rolloff` | *(absent)* — no high-E down-weight | enabled (2 TeV, index 2.7) |
-| `model.dropout` | `0.05` | `0.1` |
-| `train.epochs` | `50` | `120` |
-
-Two `dual_v1`-era *improvements* that are not part of the regression are **kept**, since
-they only make evaluation/selection more honest (they do not change the trained objective
-for this config):
-
-* `train.py::validate` selects on the **robust-core** metric √(σ_robust² + bias_median²),
-  σ_robust = IQR/1.349, on E ≤ 2 TeV — tail-insensitive, so model selection is stable.
-* `evaluate.py` reports an E ≤ 2 TeV summary alongside the full range
-  (`e_cut` defaults to 2000 GeV when `loss.energy_rolloff` is absent).
-
-Verified: `config/base.yaml` resolves to plain head / bypass ON / 11 concepts /
-Kendall–Gal / no rolloff / dropout 0.05 / 50 epochs.
-
-## Data / cache
-
-By default `paths.cache_dir` points at the **shared strict cache**
-`/aifs/.../transformer/cache_full10` (10 MeV cell cut, contained + single-shower,
-3.38 M events, 11 concepts stored) — the exact cache `sw_d192` trained on. This avoids
-re-preprocessing 3.38 M events. To build a private cache instead:
+## Run
 
 ```bash
-python -m data.preprocess --config config/base.yaml --set paths.cache_dir=cache_full10
+sbatch job_v2cham.sub        # train (multi-best) -> eval 3 ckpts -> probe; cache_full10, d192, 50 ep
+bash   smoke_test.sh         # 2-epoch end-to-end check on a private throwaway cache
 ```
 
-## Run (IHEP GPU node, RTX 5090 / CUDA 13)
-
-```bash
-sbatch job_v2.sub          # train -> evaluate -> probe on cache_full10, d192, 50 epochs
-```
-
-Or interactively, after bringing up the node (`../aiGPU.md`) and
-`source .../HREDML/loadCondaEnvCuda13.sh`:
-
-```bash
-python train.py    --config config/base.yaml
-python evaluate.py --config config/base.yaml
-python probe.py    --config config/base.yaml
-# override anything: python train.py --config config/base.yaml --set model.d_model=256
-```
-
-`bash smoke_test.sh` runs a 2-epoch end-to-end check on a **private** 20 k-event throwaway
-cache (`cache_smoke`) — it never touches the shared `cache_full10`.
-
-## Files
-
-| Path | Purpose |
-|------|---------|
-| `config/base.yaml` | all knobs; **set to the `sw_d192` baseline** |
-| `data/geometry.py` | physical cell geometry (per-superlayer view) |
-| `data/inspect_root.py` | verify ROOT branches/units — run first on a new cache |
-| `data/preprocess.py` | ROOT → tokenised CSR cache + concept/energy targets + meta |
-| `data/dataset.py` | dataset, token features, reflection augmentation, concept-trim, collate |
-| `models/embedding.py` | token + positional embedding |
-| `models/encoder.py` | pre-LN SDPA Transformer blocks |
-| `models/bottleneck.py` | soft concept bottleneck (residual-bypass + `e_phys` flags) |
-| `models/heads.py` | energy + recon heads (+ reserved registry) |
-| `models/model.py` | assembly; forward returns a dict |
-| `losses/objectives.py` | per-task Huber losses with optional per-sample weights |
-| `losses/uncertainty.py` | `UncertaintyWeighter` (Kendall–Gal) / `NormalizedWeighter` / `FixedWeighter` |
-| `train.py` / `evaluate.py` / `probe.py` | train / metrics+plots / physics probes |
-| `job_v2.sub` | SLURM job (train→eval→probe on `cache_full10`, d192, 50 epochs) |
-| `run.sh` / `smoke_test.sh` / `summarize_runs.py` | full pipeline / quick check / sweep summary |
-
-See `../var.md` for the ECAL branch dictionary and `../geo.md` for the geometry.
+See `../transformer_v2/EXPERIMENT_LOG.md` for the full sweep and `../transformerReport/` for
+the study.

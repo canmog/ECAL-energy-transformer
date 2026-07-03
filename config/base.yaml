@@ -1,10 +1,15 @@
 # ============================================================================
-# transformer_v2/ — physics-grounded ECAL energy reconstruction (AMS-02)
+# transformer_v2cham/ — CHAMPION: wdx + v2m1 + v2b (multi-best / configurable selection)
 #
-# CONFIG = the `sw_d192` BASELINE (the best result to date: bin-avg sigma/E
-#          5.97% over the full range, 5.62% restricted to E<=2 TeV, robust-core
-#          1.36% <=2 TeV).  This is a CLEAN reproduction of that baseline, kept as
-#          the foundation for the next step.
+# Stacks the two proven orthogonal wins on the sw_d192 model and runs them inside the v2b
+# selection framework, so ONE run yields the best checkpoint on each axis:
+#   * wdx          -> wd_exclude_1d=true  (exclude 1-D params from weight decay; best core)
+#   * v2m1         -> loss.fit_quality_weight (down-weight concept+recon on poorly-fit
+#                     events; best raw-std tail)
+#   * v2b (a)+(b)  -> train.select_metric (composite; tail_weight=0 here) + multi-best
+#                     checkpoints best.pt / best_robust.pt / best_raw.pt
+# Pick best_robust.pt for the robust core, best_raw.pt for the tail (raw-std is noisy, so
+# multi-best beats tuning a tail_weight). Reuses cache_full10; d192; 50 epochs.
 #
 # What "sw_d192 baseline" means, concretely (vs. the dual_v1 build it was forked
 # from): plain energy head, residual bypass ON, ALL 11 concepts, Kendall-Gal
@@ -31,7 +36,7 @@ paths:
   # re-preprocess 3.38M events. Override with --set paths.cache_dir=... to rebuild
   # a private cache here.
   cache_dir: /aifs/user/data/lishanglin/chenhao/transformer/cache_full10
-  out_dir:   /aifs/user/data/lishanglin/chenhao/transformer_v2/runs/v2_d192
+  out_dir:   /aifs/user/data/lishanglin/chenhao/transformer_v2cham/runs/v2cham_d192
 
 data:
   target_branch: mcEne          # MC truth energy (GeV)
@@ -127,6 +132,8 @@ loss:
   energy:  {delta: 0.1}
   concept: {delta: 0.1}
   recon:   {delta: 0.1}
+  # CHAMPION: v2m1 fit-quality weighting (down-weight concept+recon on poorly-fit events).
+  fit_quality_weight: {enabled: true, apply_to: [concept, recon], beta: 1.0, w_min: 0.2}
 
 train:
   epochs: 50                    # sw_d192 baseline run length
@@ -136,12 +143,15 @@ train:
   optimizer: adamw              # validated; anything else raises
   lr: 3.0e-4
   weight_decay: 1.0e-2          # NOT applied to the Kendall-Gal log-variances
-  wd_exclude_1d: true           # PROMOTED DEFAULT (2026-06-25): exclude 1-D params
-                                # (LayerNorm / bias / AttnPool-query) from weight decay --
-                                # the standard transformer recipe. Proven win vs the exact
-                                # sw_d192 baseline: rob<=2TeV 1.63%->1.40%, outlier
-                                # 2.05%->1.47%, median-bias -0.73%->-0.05%. Set false to
-                                # recover the EXACT sw_d192 reproduction (all params decayed).
+  wd_exclude_1d: true           # CHAMPION: the wdx win (exclude 1-D params from weight decay).
+  # v2b (a): CONFIGURABLE composite checkpoint-selection metric. With tail_weight=0 +
+  # core=robust + bias=median this is EXACTLY the v2_d192 method; raise tail_weight or
+  # switch core/tail_term to A/B a tail-aware selection. Drives best.pt + early stop.
+  #   core:      robust | raw_std
+  #   bias:      median | mean | none
+  #   tail_term: none | outlier | raw_std | excess   (excess = raw_std - robust)
+  #   metric = sqrt(core^2 + bias^2) + tail_weight * tail_term
+  select_metric: {core: robust, bias: median, tail_term: none, tail_weight: 0.0}
   warmup_epochs: 5
   grad_clip: 5.0
   amp_dtype: bf16               # bf16 | fp32/none (honored; fp16 raises)

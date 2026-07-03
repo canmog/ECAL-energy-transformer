@@ -1,0 +1,36 @@
+#!/bin/bash
+#SBATCH --job-name=tf_v2cham
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=1-00:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+# transformer_v2cham CHAMPION: wd_exclude_1d=true (wdx) + loss.fit_quality_weight (v2m1)
+# + v2b multi-best/configurable selection (tail_weight=0). Trains once, evaluates EACH
+# saved best (best, best_robust, best_raw) into metrics_<ck>.json. cache_full10, d192, 50 ep.
+cd "$SLURM_SUBMIT_DIR" || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+set -o pipefail
+CFG=config/base.yaml
+C=/aifs/user/data/lishanglin/chenhao/transformer/cache_full10   # shared strict cache
+O=runs/v2cham_d192
+mkdir -p $O
+echo "##### START $(hostname) $(date '+%F %T') #####"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+if python train.py --config $CFG --set paths.cache_dir=$C paths.out_dir=$O 2>&1 | tee $O/train.log | tail -8; then
+  for CK in best best_robust best_raw; do
+    if [ -f "$O/$CK.pt" ]; then
+      echo "----- evaluate $CK -----"
+      python evaluate.py --config $CFG --ckpt $O/$CK.pt --set paths.cache_dir=$C paths.out_dir=$O 2>&1 | tee $O/eval_$CK.log | tail -4
+      mv -f $O/metrics.json $O/metrics_$CK.json
+    fi
+  done
+  python probe.py --config $CFG --ckpt $O/best.pt --set paths.cache_dir=$C paths.out_dir=$O 2>&1 | tee $O/probe.log | tail -12
+  echo "##### V2CHAM_DONE $(date '+%F %T') #####"
+else
+  echo "##### !! V2CHAM TRAIN FAILED #####"
+fi

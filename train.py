@@ -58,8 +58,28 @@ def energy_weight(energy_gev, cfg):
     return torch.clamp((e_cut / energy_gev.clamp_min(1e-3)) ** index, max=1.0)
 
 
-def compute_losses(out, batch, cfg):
+def aux_weight(batch, cfg):
+    """v2m1 per-event fit-quality weight for the PHYSICS (concept/recon) losses.
+    w = clip((m/resid)^beta, w_min, 1), m = train-median residual (set in main()).
+    Energy loss is NEVER weighted (mcEne is truth). None when disabled / no fit_resid."""
+    fqw = cfg.loss.get("fit_quality_weight", None)
+    if fqw is None or not fqw.get("enabled", False) or "fit_resid" not in batch:
+        return None
+    scale = float(fqw.get("scale", 0.0))
+    if scale <= 0.0:
+        return None
+    beta = float(fqw.get("beta", 1.0)); w_min = float(fqw.get("w_min", 0.2))
+    resid = batch["fit_resid"].clamp_min(1e-9)
+    return ((scale / resid) ** beta).clamp(w_min, 1.0)
+
+
+def compute_losses(out, batch, cfg, apply_aux_weight=True):
     w = energy_weight(batch["energy"], cfg)            # per-sample weight on energy heads
+    w_a = aux_weight(batch, cfg) if apply_aux_weight else None   # fit-quality weight (aux)
+    fqw = cfg.loss.get("fit_quality_weight", None)
+    apply_to = (fqw.get("apply_to", ["concept", "recon"]) if (fqw and w_a is not None) else [])
+    wc = w_a if "concept" in apply_to else None
+    wr = w_a if "recon" in apply_to else None
     losses = {}
     if "energy" in out:
         losses["energy"] = energy_loss(out["energy"], batch["log_e"], cfg.loss.energy.delta, w=w)
@@ -67,8 +87,8 @@ def compute_losses(out, batch, cfg):
         losses["e_phys"] = energy_loss(out["e_phys"], batch["log_e"], cfg.loss.energy.delta, w=w)
     if "recon" in out:
         losses["recon"] = recon_loss(out["recon"], batch["recon"], batch["valid"],
-                                     cfg.loss.recon.delta)
-    losses["concept"] = concept_loss(out["concepts"], batch["concepts"], cfg.loss.concept.delta)
+                                     cfg.loss.recon.delta, w=wr)
+    losses["concept"] = concept_loss(out["concepts"], batch["concepts"], cfg.loss.concept.delta, w=wc)
     return losses
 
 
@@ -100,7 +120,9 @@ def validate(model, raw, loader, cfg, device, amp_dtype):
         # Store each batch's SUM (= mean * n_events); divide by total events below.
         nb = int(batch["energy"].shape[0])
         nev.append(nb)
-        for k, v in compute_losses(out, batch, cfg).items():
+        # log UNWEIGHTED aux losses so val_concept/val_recon stay comparable to baseline;
+        # the fit-quality weight only shapes the TRAINING objective.
+        for k, v in compute_losses(out, batch, cfg, apply_aux_weight=False).items():
             agg.setdefault(k, []).append(float(v) * nb)
     r = np.concatenate(rs); et = np.concatenate(ets)
     # Model selection on the ROBUST core sigma (IQR/1.349) + MEDIAN bias, restricted to the
@@ -115,9 +137,20 @@ def validate(model, raw, loader, cfg, device, amp_dtype):
     q75, q25 = np.percentile(rr, [75, 25])
     res = float((q75 - q25) / 1.349)                # robust core sigma  (the resolution)
     bias = float(np.median(rr))                     # median bias        (robust)
-    metric = float(np.sqrt(res ** 2 + bias ** 2))   # bias-aware robust  -> drives selection
+    bias_mean = float(np.mean(rr))                  # mean bias          (raw)
     outlier = float(np.mean(np.abs(rr) > 0.20))     # tail: fraction |dE/E| > 20%
-    res_raw = float(np.std(rr))                     # raw std (tail-sensitive), logged only
+    res_raw = float(np.std(rr))                     # raw std (tail-sensitive)
+    # v2b (a): CONFIGURABLE composite selection metric. Defaults (robust/median/none/0)
+    # reproduce the v2_d192 method exactly; switch core/bias/tail_term/tail_weight to A/B.
+    sm = cfg.train.get("select_metric", None)
+    core_k = sm.get("core", "robust") if sm else "robust"
+    bias_k = sm.get("bias", "median") if sm else "median"
+    tail_k = sm.get("tail_term", "none") if sm else "none"
+    tail_w = float(sm.get("tail_weight", 0.0)) if sm else 0.0
+    core = res_raw if core_k == "raw_std" else res
+    bval = {"median": bias, "mean": bias_mean, "none": 0.0}[bias_k]
+    tval = {"none": 0.0, "outlier": outlier, "raw_std": res_raw, "excess": res_raw - res}[tail_k]
+    metric = float(np.sqrt(core ** 2 + bval ** 2) + tail_w * tval)   # -> drives selection
     n_total = max(sum(nev), 1)
     means = {k: float(np.sum(v)) / n_total for k, v in agg.items()}
     return {"val_bias": bias, "val_res": res, "val_res_raw": res_raw,
@@ -138,6 +171,16 @@ def main():
 
     meta = load_meta(cfg.paths.cache_dir)
     train_loader, val_loader = build_loaders(cfg, meta)
+
+    # v2m1 fit-quality weight scale = TRAIN-median residual (no leakage); set on cfg for
+    # compute_losses (champion = wdx + v2m1 + v2b multi-best/select).
+    fqw = cfg.loss.get("fit_quality_weight", None)
+    if fqw is not None and fqw.get("enabled", False):
+        m = float(np.median(train_loader.dataset.fit_resid))
+        setattr(fqw, "scale", m)
+        print(f"[fit_quality_weight] enabled: apply_to={fqw.get('apply_to')}, "
+              f"beta={fqw.get('beta', 1.0)}, w_min={fqw.get('w_min', 0.2)}, "
+              f"train-median resid scale={m:.4g}")
 
     concept_use = cfg.data.get("concept_use", None)
     n_concepts = len(concept_use) if concept_use else meta["n_concepts"]
@@ -217,7 +260,14 @@ def main():
     with open(os.path.join(cfg.paths.out_dir, "config.json"), "w") as f:
         json.dump(raw_cfg, f, indent=2)
 
-    best, bad, header = float("inf"), 0, None
+    # v2b (b): track MULTIPLE "best" checkpoints in one run so the selection-metric effect
+    # can be compared post-hoc without retraining. best.pt = configured composite metric
+    # (also drives early stop); best_robust.pt = min robust core; best_raw.pt = min raw std
+    # (the sw_d192-style selection).
+    bests = {"metric": float("inf"), "robust": float("inf"), "raw": float("inf")}
+    bfile = {"metric": "best.pt", "robust": "best_robust.pt", "raw": "best_raw.pt"}
+    bcrit = {"metric": "val_metric", "robust": "val_res", "raw": "val_res_raw"}
+    bad, header = 0, None
     for epoch in range(cfg.train.epochs):
         model.train()
         tot, task_sums, n_batches, n_events = 0.0, {t: 0.0 for t in task_names}, 0, 0
@@ -275,15 +325,20 @@ def main():
         ckpt = {"model": raw.state_dict(), "weighter": weighter.state_dict(),
                 "meta": meta, "config": raw_cfg, "epoch": epoch, "val": val}
         torch.save(ckpt, os.path.join(cfg.paths.out_dir, "last.pt"))
-        if val["val_metric"] < best:
-            best, bad = val["val_metric"], 0
-            torch.save(ckpt, os.path.join(cfg.paths.out_dir, "best.pt"))
+        improved = val["val_metric"] < bests["metric"]      # composite drives early stop
+        for key in ("metric", "robust", "raw"):
+            if val[bcrit[key]] < bests[key]:
+                bests[key] = val[bcrit[key]]
+                torch.save(ckpt, os.path.join(cfg.paths.out_dir, bfile[key]))
+        if improved:
+            bad = 0
         else:
             bad += 1
             if bad >= cfg.train.early_stop_patience:
-                print(f"early stop at epoch {epoch} (best metric {best*100:.2f}%)")
+                print(f"early stop at epoch {epoch} (best composite {bests['metric']*100:.2f}%)")
                 break
-    print(f"done. best bias-aware metric = {best*100:.2f}%  ->  {cfg.paths.out_dir}/best.pt")
+    print(f"done. best composite={bests['metric']*100:.2f}%  robust={bests['robust']*100:.2f}%  "
+          f"raw={bests['raw']*100:.2f}%  ->  {cfg.paths.out_dir}/{{best,best_robust,best_raw}}.pt")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,18 @@ class EcalTokens(Dataset):
         self.energy = z["energy"].astype(np.float32)
         concepts = z["concepts"].astype(np.float32)
 
+        # v2m1: per-event 3D-fit goodness = token-level relative residual
+        #   resid = sum|ehit - expe| / (sum ehit + eps)
+        # computed once over the CSR layout (no cache rebuild). Used to DOWN-weight the
+        # physics (concept/recon) supervision on poorly-fit events; it is energy-based
+        # so mirror augmentation leaves it unchanged.
+        if len(self.off) > 1:
+            num = np.add.reduceat(np.abs(self.ehit - self.expe), self.off[:-1])
+            den = np.add.reduceat(self.ehit, self.off[:-1])
+            self.fit_resid = (num / np.clip(den, 1e-9, None)).astype(np.float32)
+        else:
+            self.fit_resid = np.zeros(0, dtype=np.float32)
+
         # Concept-set trim (load-time column subset; NO cache rebuild). concept_use is
         # an optional list of concept NAMES to keep (energy-irrelevant x0/y0/kx/ky are
         # typically dropped); None = all stored concepts, in cache order.
@@ -99,6 +111,7 @@ class EcalTokens(Dataset):
             "log_e": torch.tensor(log_e, dtype=torch.float32),
             "energy": torch.tensor(self.energy[i], dtype=torch.float32),
             "concepts": torch.from_numpy(concept_std.astype(np.float32)),
+            "fit_resid": torch.tensor(self.fit_resid[i], dtype=torch.float32),
         }
 
 
@@ -124,6 +137,7 @@ def collate(batch):
         "log_e": torch.stack([b["log_e"] for b in batch]),
         "energy": torch.stack([b["energy"] for b in batch]),
         "concepts": torch.stack([b["concepts"] for b in batch]),
+        "fit_resid": torch.stack([b["fit_resid"] for b in batch]),
     }
 
 
