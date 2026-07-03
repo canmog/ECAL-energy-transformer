@@ -86,7 +86,7 @@ def amp_dtype_of(cfg):
 @torch.no_grad()
 def validate(model, raw, loader, cfg, device, amp_dtype):
     model.eval()
-    rs, ets, agg = [], [], {}
+    rs, ets, agg, nev = [], [], {}, []
     for batch in loader:
         batch = to_device(batch, device)
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
@@ -95,8 +95,13 @@ def validate(model, raw, loader, cfg, device, amp_dtype):
         r = ((e_pred - batch["energy"]) / batch["energy"].clamp_min(1e-3)).cpu().numpy()
         rs.append(r)
         ets.append(batch["energy"].cpu().numpy())
+        # EVENT-weight the per-task loss logs: the token-budget sampler yields very
+        # different event-counts per batch, so a plain mean over batches is size-biased.
+        # Store each batch's SUM (= mean * n_events); divide by total events below.
+        nb = int(batch["energy"].shape[0])
+        nev.append(nb)
         for k, v in compute_losses(out, batch, cfg).items():
-            agg.setdefault(k, []).append(float(v))
+            agg.setdefault(k, []).append(float(v) * nb)
     r = np.concatenate(rs); et = np.concatenate(ets)
     # Model selection on the ROBUST core sigma (IQR/1.349) + MEDIAN bias, restricted to the
     # reliable range (E <= e_cut). Robust = tail-insensitive => STABLE selection (raw std
@@ -113,7 +118,8 @@ def validate(model, raw, loader, cfg, device, amp_dtype):
     metric = float(np.sqrt(res ** 2 + bias ** 2))   # bias-aware robust  -> drives selection
     outlier = float(np.mean(np.abs(rr) > 0.20))     # tail: fraction |dE/E| > 20%
     res_raw = float(np.std(rr))                     # raw std (tail-sensitive), logged only
-    means = {k: float(np.mean(v)) for k, v in agg.items()}
+    n_total = max(sum(nev), 1)
+    means = {k: float(np.sum(v)) / n_total for k, v in agg.items()}
     return {"val_bias": bias, "val_res": res, "val_res_raw": res_raw,
             "val_outlier": outlier, "val_metric": metric,
             **{f"val_{k}": v for k, v in means.items()}}
@@ -160,7 +166,21 @@ def main():
     else:
         weighter = FixedWeighter(task_names).to(device)
 
-    model = torch.compile(raw, dynamic=True) if cfg.train.compile else raw
+    # Keep compile=true but make it NON-FATAL. torch.compile is lazy (it traces on
+    # the FIRST forward), and inductor has a documented dynamic-shape crash on this
+    # full scaffolded model (sympy `assert p>=0`; it killed the m1/m4/m2 runs and can
+    # also fire on a mid-training recompile). Guard the construct here AND the runtime
+    # step below; eager is numerically identical, so we just fall back to it.
+    compiled = False
+    if cfg.train.compile:
+        try:
+            model = torch.compile(raw, dynamic=True)
+            compiled = True
+        except Exception as e:
+            print(f"[warn] torch.compile() failed ({type(e).__name__}: {e}); using eager")
+            model = raw
+    else:
+        model = raw
     amp_dtype = amp_dtype_of(cfg)
 
     if str(cfg.train.optimizer).lower() != "adamw":
@@ -170,7 +190,18 @@ def main():
     # no longer blow up, and this gentle pull toward s->0 self-limits any residual
     # drift instead of diverging on large datasets. Set loss.logvar_weight_decay=0 to
     # restore the old un-decayed behaviour.
-    groups = [{"params": list(raw.parameters())}]
+    # Weight-decay groups. By DEFAULT every model param is decayed at train.weight_decay
+    # -- this exactly reproduces sw_d192 (the v2 baseline contract). Set
+    # train.wd_exclude_1d=true for the standard transformer recipe: exclude 1-D params
+    # (LayerNorm scales, biases, the AttnPool query) from WD. That is a deliberate A/B
+    # CHANGE to the trained objective, not part of the reproduction, hence opt-in.
+    if cfg.train.get("wd_exclude_1d", False):
+        decay = [p for p in raw.parameters() if p.requires_grad and p.ndim >= 2]
+        nodecay = [p for p in raw.parameters() if p.requires_grad and p.ndim < 2]
+        groups = [{"params": decay, "weight_decay": cfg.train.weight_decay},
+                  {"params": nodecay, "weight_decay": 0.0}]
+    else:
+        groups = [{"params": list(raw.parameters())}]
     wparams = list(weighter.parameters())
     if wparams:
         groups.append({"params": wparams,
@@ -189,30 +220,46 @@ def main():
     best, bad, header = float("inf"), 0, None
     for epoch in range(cfg.train.epochs):
         model.train()
-        tot, task_sums, n_batches = 0.0, {t: 0.0 for t in task_names}, 0
+        tot, task_sums, n_batches, n_events = 0.0, {t: 0.0 for t in task_names}, 0, 0
         for batch in train_loader:
             batch = to_device(batch, device)
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-                out = model(batch)
-                losses = compute_losses(out, batch, cfg)
-                total, _ = weighter(losses)
-            total.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, cfg.train.grad_clip)
-            opt.step()
-            tot += float(total.detach())
+            try:
+                opt.zero_grad(set_to_none=True)
+                with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+                    out = model(batch)
+                    losses = compute_losses(out, batch, cfg)
+                    total, _ = weighter(losses)
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(all_params, cfg.train.grad_clip)
+                opt.step()
+            except Exception as e:
+                # inductor can raise at the first forward or on a mid-training
+                # recompile. Fall back to eager ONCE (skipping this one batch) and
+                # keep training; if we are already eager this is a real error.
+                if not compiled:
+                    raise
+                print(f"[warn] compiled step failed ({type(e).__name__}: {e}); "
+                      "switching to eager for the rest of training")
+                model, compiled = raw, False
+                continue
+            # EVENT-weight epoch averages: batches vary a lot in event-count under the
+            # token-budget sampler, so accumulate each batch's SUM (= mean * n_events)
+            # and divide by total events below -> per-event means, not size-biased.
+            nb = int(batch["energy"].shape[0])
+            tot += float(total.detach()) * nb
             for t, l in losses.items():
-                task_sums[t] += float(l.detach())
+                task_sums[t] += float(l.detach()) * nb
             n_batches += 1
+            n_events += nb
         sched.step()
 
         val = validate(model, raw, val_loader, cfg, device, amp_dtype)
         # NOTE: train_total is the optimization objective and includes the +0.5*s
         # regularizer (can be negative); the train_<task> columns are the raw,
-        # comparable per-task losses averaged over the epoch.
+        # comparable per-task losses, EVENT-weighted (per-event mean) over the epoch.
         wlogs = {f"w_{t}": w for t, w in weighter.task_weights().items()}
-        wlogs.update({f"train_{t}": task_sums[t] / max(n_batches, 1) for t in task_names})
-        row = {"epoch": epoch, "train_total": tot / max(n_batches, 1),
+        wlogs.update({f"train_{t}": task_sums[t] / max(n_events, 1) for t in task_names})
+        row = {"epoch": epoch, "train_total": tot / max(n_events, 1),
                "lr": opt.param_groups[0]["lr"], **val, **wlogs}
         if header is None:
             header = list(row.keys())

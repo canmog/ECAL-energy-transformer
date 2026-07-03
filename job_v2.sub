@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tf_dual_v1
+#SBATCH --job-name=tf_v2_d192
 #SBATCH --partition=gpu
 #SBATCH --qos=gpunormal
 #SBATCH --account=ihepai
@@ -8,23 +8,24 @@
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
 #SBATCH --output=runs/slurm-%x-%j.out
-# dual_v1: residual-bypass OFF + dual energy head (e_phys+e_free) + NormalizedWeighter
-# + 2 TeV energy rolloff + 7-concept trim, on cache_full10 (d192, 50 epochs).
-# Baseline to beat = sw_d192 (binwise sigma/E <=2 TeV = 5.62%).
+# transformer_v2: CLEAN reproduction of the sw_d192 BASELINE (the best to date).
+#   plain energy head, residual bypass ON, all 11 concepts, Kendall-Gal weighting,
+#   NO energy rolloff, dropout 0.05, d192, 50 epochs, on the strict cache_full10.
+# Target to reproduce: bin-avg sigma/E 5.97% (full range), 5.62% (<=2 TeV).
 cd "$SLURM_SUBMIT_DIR" || exit 1
 source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 set -o pipefail
 CFG=config/base.yaml
-C=/aifs/user/data/lishanglin/chenhao/transformer/cache_full10
-O=runs/dual_v1
+C=/aifs/user/data/lishanglin/chenhao/transformer/cache_full10   # shared strict cache
+O=runs/v2_d192
 mkdir -p $O
 echo "##### START $(hostname) $(date '+%F %T') #####"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-if python train.py --config $CFG --set paths.cache_dir=$C paths.out_dir=$O train.epochs=50 2>&1 | tee $O/train.log | tail -8; then
+if python train.py --config $CFG --set paths.cache_dir=$C paths.out_dir=$O 2>&1 | tee $O/train.log | tail -8; then
   python evaluate.py --config $CFG --set paths.cache_dir=$C paths.out_dir=$O 2>&1 | tee $O/eval.log | tail -6
   python probe.py    --config $CFG --set paths.cache_dir=$C paths.out_dir=$O 2>&1 | tee $O/probe.log | tail -12
-  echo "##### DUAL_V1_DONE $(date '+%F %T') #####"
+  echo "##### V2_D192_DONE $(date '+%F %T') #####"
 else
-  echo "##### !! DUAL_V1 TRAIN FAILED #####"
+  echo "##### !! V2_D192 TRAIN FAILED #####"
 fi

@@ -28,6 +28,17 @@ from data.geometry import N_CELL, build_geometry_table, t_norm_table
 from models.model import EcalTransformer
 
 
+def amp_dtype_of(cfg):
+    """Honor train.amp_dtype: bf16 -> autocast bf16; fp32/none -> no autocast.
+    (Mirrors train.py so the probe runs at the SAME precision the model trained in.)"""
+    name = str(cfg.train.get("amp_dtype", "bf16")).lower()
+    if name == "bf16":
+        return torch.bfloat16
+    if name in ("fp32", "none"):
+        return None
+    raise ValueError(f"train.amp_dtype={name!r} unsupported (use bf16 | fp32 | none)")
+
+
 def ridge_r2(X, Y, lam=1.0):
     """Closed-form ridge on a 50/50 split; return per-target R^2 on the held-out half.
 
@@ -68,6 +79,7 @@ def main():
     model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
     model.eval()
 
+    amp_dtype = amp_dtype_of(cfg)
     probe_ds = EcalTokens(cfg.paths.cache_dir, args.split, meta, concept_use=concept_use)
     loader = make_loader(probe_ds, cfg, shuffle=False)
     tnorm_lut = torch.tensor(t_norm_table(build_geometry_table(meta["geometry_data_type"])),
@@ -80,7 +92,7 @@ def main():
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         valid = batch["valid"]
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             out = model(batch)
             o_np = model(batch, phys_scale=0.0)
             o_nf = model(batch, free_scale=0.0)
@@ -106,7 +118,7 @@ def main():
         cell = torch.where(is_x, (N_CELL - 1) - cell, cell)
         mb["pos_id"] = layer * N_CELL + cell
         mb["feats"][:, :, 1] = torch.where(is_x, tnorm_lut[mb["pos_id"]], mb["feats"][:, :, 1])
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             om = model(mb)
         e_mirror.append(model.predict_energy_gev(om["energy"].float()).cpu().numpy())
 

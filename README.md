@@ -1,111 +1,106 @@
-# transformer/ — physics-grounded ECAL energy reconstruction (AMS-02), build "dual_v1"
+# transformer_v2/ — clean `sw_d192` baseline (foundation for the next step)
 
-A Transformer over ECAL cell deposits that is **forced to reason through physics**
-instead of a black box. The 3D-fit shower parameters shape an intermediate layer (a
-soft concept bottleneck); the energy estimate is split into a physics-grounded part and
-a free correction, so the representation is inspectable and physically grounded.
+A **clean reproduction of the `sw_d192` baseline** — the best ECAL energy-resolution
+result obtained so far on the complete AMS-02 dataset. This directory exists to be a
+tidy, known-good starting point: nothing from the regressed `dual_v1` experiment line
+is active, so the next idea is built on top of the configuration that actually wins.
 
-## This build (`config/base.yaml` defaults)
+See `../transformerReport/report.tex` (and `report.pdf`) for the full study. The model,
+physics rationale, geometry, and probes are documented in `../transformer/README.md`;
+this file only covers what is specific to `transformer_v2`.
+
+## What "the `sw_d192` baseline" is
+
+`sw_d192` on the complete 50-file dataset (strict cache, `cache_full10`):
 
 ```
-input    :  kx_ehit           per-cell deposition, sparse tokens (E > 10 MeV)
-energy   :  e_phys + e_free    e_phys from the concept-grounded pooled h_phys;
-                               e_free a deep correction -> standardised log(mcEne)
-recon    :  kx_expehit         per-cell fitted deposit (denoise)
-concepts :  soft bottleneck -> 7 energy-relevant 3D-fit params (x0/y0/kx/ky dropped)
-balance  :  NormalizedWeighter (EMA loss-norm + FIXED weights: energy 1.0, aux 0.3)
-energy wt:  power-law rolloff above 2 TeV on the energy loss AND the val metric
+bin-averaged sigma/E :  5.97 %  (full range)     5.62 %  (E <= 2 TeV)
+robust-core sigma    :  1.36 %  (IQR/1.349, E <= 2 TeV)
+overall sigma/E      :  6.52 %      bias -1.37 %      d_model = 192
 ```
 
-* **Soft concept bottleneck** (`models/bottleneck.py`): at block `tap_block` (=3) the
-  token rep splits into `h_phys` (supervised by the 3D-fit concepts) ‖ `h_free`
-  (residual), recombined for the upper blocks. The additive `tokens +` residual bypass
-  is **OFF** (`bottleneck_residual: false`), so the upper blocks read *only* the
-  recombined sub-spaces — the physics sub-space can no longer be routed around.
-* **Dual energy head** (`dual_energy_head: true`): `energy = e_phys + e_free`. `e_phys`
-  is read off the *same pooled `h_phys`* that predicts the concepts (a physics baseline,
-  gauge-fixed by its own auxiliary energy loss); `e_free` is the deep, full-depth
-  correction. Additive in standardised log-E ⇒ multiplicative on E. Plus the per-cell
-  `kx_expehit` recon head.
-* **Loss balance** (`losses/uncertainty.py::NormalizedWeighter`): each task loss is
-  EMA-normalised to O(1), then summed with FIXED manual weights (energy 1.0, aux 0.3).
-  Replaces Kendall–Gal homoscedastic weighting, whose learnable log-variance ran away
-  (w_energy ≈ 450) and destabilised training on the large dataset.
-* **Energy-region weighting** (`losses.energy_rolloff`): unit weight up to `e_cut`
-  = 2 TeV (the ECAL electron reliability limit), power-law (index 2.7) decay above, on
-  both the training energy loss and the validation selection metric — so the
-  leakage-dominated high-E tail no longer drives the score (no hard cut).
-* **Concept trim** (`data.concept_use`): the bottleneck predicts the 7 energy-relevant
-  concepts (`shwr_z0, shwr_a0, frac_lat, frac_rear, tmax, lat_width, long_width`);
-  `x0/y0/kx/ky` are dropped — energy-irrelevant and not linearly decodable from a pooled
-  head (R²≈0). The cache still stores all 11; the trim is a load-time subset, no rebuild.
+It matches the single-file baseline on the **complete** data and is markedly better at
+TeV (3 TeV bin 8.8 % vs the broken 18.4 %). Concepts are learned at R² ≈ 0.95–1.00 for
+the energy-relevant set. Per the report, **no variant has beaten it**: the later
+`dual_v1` "new stack" (NormalizedWeighter + 2 TeV rolloff + 7-concept trim, dual head,
+bypass-off) cost ~+1.66 % binned σ/E, outweighing every architecture/anchor gain. Hence
+this reset.
 
-Every item above is a config flag (`model.bottleneck_residual`, `model.dual_energy_head`,
-`loss.weighting`, `loss.weights`, `loss.energy_rolloff`, `data.concept_use`) so each can
-be toggled for ablation; defaults in code reproduce the pre-dual_v1 behaviour.
+## The config (`config/base.yaml`) = `sw_d192`, exactly
 
-## Variants — controlled comparison (same events, same stack, only one thing differs)
+The code here is the same `dual_v1` build as `../transformer/`, but **every new-stack
+knob is config-gated back to the pre-`dual_v1` behaviour**, reproducing `sw_d192`:
 
-* **`../transformer_m4`** — same dual head, but the physics/free split is at the encoder
-  **output** (end-split), not mid-network. Isolates the split location.
-* **`../transformer_m2`** — **anchored** energy: `kx_EneL2Cor` + a tight log-space
-  residual (no dual head). Isolates the value of the in-detector leakage anchor.
-* **`../transformer_m3`** — clean cell→energy, no scaffolding (control).
+| knob | `sw_d192` (here) | `dual_v1` (off here) |
+|------|------------------|----------------------|
+| `model.dual_energy_head` | `false` — plain energy head | `true` — `e_phys + e_free` |
+| `model.bottleneck_residual` | `true` — `tokens +` skip ON | `false` — bypass removed |
+| `data.concept_use` | *(absent)* — all **11** concepts | 7-concept trim |
+| `loss.weighting` | *(absent)* → **Kendall–Gal** (`uncertainty`) | `normalized` (fixed aux 0.3) |
+| `loss.energy_rolloff` | *(absent)* — no high-E down-weight | enabled (2 TeV, index 2.7) |
+| `model.dropout` | `0.05` | `0.1` |
+| `train.epochs` | `50` | `120` |
 
-## Geometry — physical, never indices (`data/geometry.py`)
+Two `dual_v1`-era *improvements* that are not part of the regression are **kept**, since
+they only make evaluation/selection more honest (they do not change the trained objective
+for this config):
 
-From `../geo.md` + the AMS-02 ECAL papers:
-* 9 superlayers, **view alternates per superlayer**: `view = (ilayer//2) % 2`
-  → X = superlayers {0,2,4,6,8} (5), Y = {1,3,5,7} (4). `OffSetMC[sl][ilayer%2]`.
-* depth `z = Ecal_Z[ilayer]` (cm); pitch 9 mm; each layer ≈ 1 X₀.
-* A layer measures one projection → token = `(z, t, view)`; attention fuses views.
-* Augmentation = x/y **reflections only** (90° is invalid: 5 ≠ 4 superlayers); concept
-  targets are sign-flipped accordingly.
+* `train.py::validate` selects on the **robust-core** metric √(σ_robust² + bias_median²),
+  σ_robust = IQR/1.349, on E ≤ 2 TeV — tail-insensitive, so model selection is stable.
+* `evaluate.py` reports an E ≤ 2 TeV summary alongside the full range
+  (`e_cut` defaults to 2000 GeV when `loss.energy_rolloff` is absent).
+
+Verified: `config/base.yaml` resolves to plain head / bypass ON / 11 concepts /
+Kendall–Gal / no rolloff / dropout 0.05 / 50 epochs.
+
+## Data / cache
+
+By default `paths.cache_dir` points at the **shared strict cache**
+`/aifs/.../transformer/cache_full10` (10 MeV cell cut, contained + single-shower,
+3.38 M events, 11 concepts stored) — the exact cache `sw_d192` trained on. This avoids
+re-preprocessing 3.38 M events. To build a private cache instead:
+
+```bash
+python -m data.preprocess --config config/base.yaml --set paths.cache_dir=cache_full10
+```
 
 ## Run (IHEP GPU node, RTX 5090 / CUDA 13)
 
-This cluster is SLURM. Submit the batch job (sources the CUDA-13 env, trains → evaluates
-→ probes on `cache_full10`):
+```bash
+sbatch job_v2.sub          # train -> evaluate -> probe on cache_full10, d192, 50 epochs
+```
+
+Or interactively, after bringing up the node (`../aiGPU.md`) and
+`source .../HREDML/loadCondaEnvCuda13.sh`:
 
 ```bash
-sbatch job_dual_v1.sub
-# or interactively, after `source .../HREDML/loadCondaEnvCuda13.sh`:
-python data/preprocess.py --config config/base.yaml      # ROOT -> cache (once)
 python train.py    --config config/base.yaml
 python evaluate.py --config config/base.yaml
 python probe.py    --config config/base.yaml
+# override anything: python train.py --config config/base.yaml --set model.d_model=256
 ```
 
-Acceleration: bf16 autocast, Flash SDPA attention, `torch.compile`, TF32. Override
-anything: `python train.py --set model.d_model=256 train.compile=false`.
-
-## Did it learn physics? (`probe.py`)
-
-1. **Linear probe** — R² of `h_phys` vs `h_free` to the concepts.
-2. **Subspace ablation** — zero `h_phys` vs `h_free` and measure the energy shift (now
-   meaningful: with the bypass off, killing `h_phys` actually moves the energy).
-3. **Dual-head decomposition** — σ/E of `e_phys` alone vs the full `e_phys + e_free`, and
-   the free head's contribution.
-4. **Mirror stress test** — energy must be invariant under x-reflection.
+`bash smoke_test.sh` runs a 2-epoch end-to-end check on a **private** 20 k-event throwaway
+cache (`cache_smoke`) — it never touches the shared `cache_full10`.
 
 ## Files
 
 | Path | Purpose |
 |------|---------|
-| `config/base.yaml` | all knobs; selection = contained + single-shower; 10 MeV cell cut |
+| `config/base.yaml` | all knobs; **set to the `sw_d192` baseline** |
 | `data/geometry.py` | physical cell geometry (per-superlayer view) |
-| `data/inspect_root.py` | verify branches/units — run first |
+| `data/inspect_root.py` | verify ROOT branches/units — run first on a new cache |
 | `data/preprocess.py` | ROOT → tokenised CSR cache + concept/energy targets + meta |
 | `data/dataset.py` | dataset, token features, reflection augmentation, concept-trim, collate |
 | `models/embedding.py` | token + positional embedding |
 | `models/encoder.py` | pre-LN SDPA Transformer blocks |
-| `models/bottleneck.py` | soft concept bottleneck (residual-bypass flag + `e_phys` head) |
+| `models/bottleneck.py` | soft concept bottleneck (residual-bypass + `e_phys` flags) |
 | `models/heads.py` | energy + recon heads (+ reserved registry) |
-| `models/model.py` | assembly; `energy = e_phys + e_free`; forward returns a dict |
-| `losses/objectives.py` | per-task losses with optional per-sample weights |
-| `losses/uncertainty.py` | `NormalizedWeighter` / `UncertaintyWeighter` / `FixedWeighter` |
-| `train.py` / `evaluate.py` / `probe.py` | train / metrics+plots (+ ≤2 TeV) / physics tests |
-| `job_dual_v1.sub` | SLURM job (train→eval→probe on `cache_full10`, 50 epochs) |
+| `models/model.py` | assembly; forward returns a dict |
+| `losses/objectives.py` | per-task Huber losses with optional per-sample weights |
+| `losses/uncertainty.py` | `UncertaintyWeighter` (Kendall–Gal) / `NormalizedWeighter` / `FixedWeighter` |
+| `train.py` / `evaluate.py` / `probe.py` | train / metrics+plots / physics probes |
+| `job_v2.sub` | SLURM job (train→eval→probe on `cache_full10`, d192, 50 epochs) |
+| `run.sh` / `smoke_test.sh` / `summarize_runs.py` | full pipeline / quick check / sweep summary |
 
-See `../var.md` for the ECAL branch dictionary and `../transformerReport/report.tex` for
-the running log of edits and results.
+See `../var.md` for the ECAL branch dictionary and `../geo.md` for the geometry.

@@ -1,9 +1,20 @@
 # ============================================================================
-# transformer/ — physics-grounded ECAL energy reconstruction (AMS-02)
+# transformer_v2/ — physics-grounded ECAL energy reconstruction (AMS-02)
 #
-# Build scope THIS round:  input  = kx_ehit (per-cell deposition)
-#                          outputs = energy  +  kx_expehit (micro reconstruction)
-#                          aux     = soft-bottleneck concept head (3D-fit params)
+# CONFIG = the `sw_d192` BASELINE (the best result to date: bin-avg sigma/E
+#          5.97% over the full range, 5.62% restricted to E<=2 TeV, robust-core
+#          1.36% <=2 TeV).  This is a CLEAN reproduction of that baseline, kept as
+#          the foundation for the next step.
+#
+# What "sw_d192 baseline" means, concretely (vs. the dual_v1 build it was forked
+# from): plain energy head, residual bypass ON, ALL 11 concepts, Kendall-Gal
+# (loss-normalised) homoscedastic weighting, NO energy rolloff, dropout 0.05,
+# 50 epochs.  The new-stack pieces (dual head, bypass-off, 2 TeV rolloff,
+# 7-concept trim) that REGRESSED resolution are deliberately OFF here.
+#
+# Build scope:  input  = kx_ehit (per-cell deposition)
+#               outputs = energy  +  kx_expehit (micro reconstruction)
+#               aux     = soft-bottleneck concept head (3D-fit params)
 # Everything marked "RESERVED" is a config/data hook, not implemented yet.
 # ============================================================================
 
@@ -12,12 +23,15 @@ device: cuda
 
 paths:
   # Merged 50-file dataset (CERN 3dfit + mcinfo pairs -> merge/merge_all.sh).
-  # root_file accepts a glob; single-file paths still work:
-  #   old single file: /aifs/user/data/lishanglin/datasets/eBep0_254000.list_0999.emini08-full.root
+  # root_file accepts a glob; single-file paths still work.
   root_file: /aifs/user/data/lishanglin/datasets/full/*-full.root
   tree: tree3dfit
-  cache_dir: /aifs/user/data/lishanglin/chenhao/transformer/cache_full
-  out_dir:   /aifs/user/data/lishanglin/chenhao/transformer/runs/base
+  # Reuse the STRICT cache that sw_d192 trained on (10 MeV cut, single-shower,
+  # contained, 11 concepts stored). Shared from the transformer/ dir so we don't
+  # re-preprocess 3.38M events. Override with --set paths.cache_dir=... to rebuild
+  # a private cache here.
+  cache_dir: /aifs/user/data/lishanglin/chenhao/transformer/cache_full10
+  out_dir:   /aifs/user/data/lishanglin/chenhao/transformer_v2/runs/v2_d192
 
 data:
   target_branch: mcEne          # MC truth energy (GeV)
@@ -27,15 +41,14 @@ data:
   threshold_mev: 10.0           # tokenize cells with stored kx_ehit > this (MeV).
                                 # Raised 0.1 -> 10 (above the standard 5 MeV reco cut):
                                 # drops sub-MIP noise cells that dominate high-E showers
-                                # and feed the high-E instability. (Old 0.1 was for
-                                # future sub-MIP PID; revisit if PID is needed.)
+                                # and feed the high-E instability.
   max_events: null              # null = all
   val_fraction: 0.15
   test_fraction: 0.15
 
-  # ---- Event selection: ALL OFF by default (your call). Flip per cut as needed.
-  # Physics note: training the ENERGY head on uncontained showers is ill-posed
-  # (the ECAL never measured the energy) — you will likely set select_contained:true.
+  # ---- Event selection (sw_d192 baseline): contained + single-shower.
+  # Physics note: the ENERGY head is ill-posed on uncontained / multi-shower events
+  # (the ECAL never cleanly measured the energy).
   selection:
     require_truth: true               # drop mcEne <= 0 (unmatched); harmless, keep on
     select_contained: true            # (kx_ShwrStat[0] & 7) == 7
@@ -46,10 +59,10 @@ data:
   nshwr_branch: kx_N_Shwr
   ref_branch: kx_EleEne
 
-  # Concept-set trim: which concepts the bottleneck actually predicts (load-time subset
-  # of the list below; NO cache rebuild). x0/y0/kx/ky dropped — energy-irrelevant and
-  # unlearnable through a pooled head (R^2~0); keep the energy-relevant scalars/profile.
-  concept_use: [shwr_z0, shwr_a0, frac_lat, frac_rear, tmax, lat_width, long_width]
+  # Concept-set trim: which concepts the bottleneck predicts (load-time subset of the
+  # list below; NO cache rebuild). sw_d192 baseline uses ALL 11 concepts, so this is
+  # LEFT OFF (commented). Uncomment to drop the energy-irrelevant x0/y0/kx/ky.
+  # concept_use: [shwr_z0, shwr_a0, frac_lat, frac_rear, tmax, lat_width, long_width]
 
   # ---- Soft-bottleneck concepts (primary shower [0]); ENERGY EXCLUDED on purpose.
   # reflect_x / reflect_y = sign the concept picks up under an x / y mirror (aug).
@@ -66,7 +79,7 @@ data:
     - {name: frac_lat,  branch: kx_FracLatLeak,  index: null, reflect_x:  1, reflect_y:  1, coord: null}
     - {name: frac_rear, branch: kx_FracRearLeak, index: null, reflect_x:  1, reflect_y:  1, coord: null}
     # Derived shower-shape concepts: energy-weighted moments of the 3D-fit EXPECTED
-    # cell map (kx_expehit), computed in preprocess -> no ROOT branch. All are scalar
+    # cell map (kx_expehit), computed in preprocess -> no ROOT branch. All scalar
     # shape quantities, invariant under x/y mirror (reflect = +1, coord null).
     #   tmax       longitudinal shower-max depth  = <layer>_E            (~X0)
     #   long_width longitudinal RMS (shower length)= sqrt(<(layer-tmax)^2>_E)
@@ -83,15 +96,13 @@ model:
   n_blocks: 6
   n_heads: 8
   ffn_mult: 4
-  dropout: 0.1
+  dropout: 0.05                 # sw_d192 baseline (best on small AND complete data)
   tap_block: 3                  # soft bottleneck after this many encoder blocks
   d_phys: 64                    # supervised sub-space (probe this)
   d_free: 128                   # residual sub-space
   pos_embed: true               # learned (layer,cell) positional embedding
-  bottleneck_residual: false    # false = drop the `tokens +` skip at the tap; upper blocks
-                                # read ONLY recombine(h_phys,h_free) (no residual bypass)
-  dual_energy_head: true        # energy = e_phys (from the concept-grounded pooled h_phys)
-                                # + e_free (deep head): physics baseline + learned supplement
+  bottleneck_residual: true     # sw_d192: KEEP the `tokens +` skip at the tap (bypass ON)
+  dual_energy_head: false       # sw_d192: PLAIN energy head (energy = single deep head)
 
 # Task heads. energy + recon active; the rest are RESERVED registry slots.
 heads:
@@ -102,33 +113,35 @@ heads:
   pid:      {enabled: false}                  # RESERVED: e/p classification
 
 loss:
-  uncertainty_weighting: true   # Kendall & Gal (2018) homoscedastic auto-balance, now
-                                # loss-normalised + log-var weight-decayed so the task
-                                # weights stay bounded on large datasets (was unbounded:
-                                # w_energy ran to 421 and destabilised training);
-                                # false = plain unweighted sum (FixedWeighter)
+  # sw_d192 baseline weighting: Kendall & Gal (2018) homoscedastic auto-balance,
+  # loss-normalised + log-var weight-decayed so the task weights stay bounded on
+  # large data (w_energy stayed ~1.3, vs the unbounded vanilla form that ran to 451).
+  uncertainty_weighting: true
   logvar_weight_decay: 0.01     # mild decay on the Kendall-Gal log-variances (0 = off)
-  weighting: normalized         # normalized (EMA loss-norm + FIXED manual weights, no
-                                # learnable s -> runaway-proof) | uncertainty (Kendall-Gal)
-                                # | fixed (plain sum). Takes precedence over the bool above.
-  weights: {energy: 1.0, e_phys: 0.3, recon: 0.3, concept: 0.3}   # priority on the
-                                # NORMALISED losses; energy primary, aux tasks scaffolding
-  energy_rolloff:               # down-weight the leakage-dominated high-E tail (NO hard cut)
-    enabled: true
-    e_cut: 2000.0               # unit weight <= e_cut (ECAL electron limit ~2 TeV)
-    index: 2.7                  # w = min(1, (e_cut/E)^index) above; 2.7 ~ cosmic-ray slope
+  # weighting: / weights:       LEFT OFF -> train.py defaults to "uncertainty"
+  #                             (Kendall-Gal) given uncertainty_weighting: true.
+  #                             The dual_v1 NormalizedWeighter (fixed aux 0.3) is NOT used.
+  # energy_rolloff:             LEFT OFF -> no high-E down-weighting (sw_d192 baseline).
+  #                             validate()/evaluate.py still report the E<=2 TeV summary
+  #                             (e_cut defaults to 2000 GeV when rolloff is absent).
   energy:  {delta: 0.1}
   concept: {delta: 0.1}
   recon:   {delta: 0.1}
 
 train:
-  epochs: 120
+  epochs: 50                    # sw_d192 baseline run length
   batch_size: 512               # hard cap on events per batch
   max_tokens_per_batch: 65536   # PADDED-token budget per batch (the real memory knob:
                                 # selected showers average ~390 tokens, max ~1160)
   optimizer: adamw              # validated; anything else raises
   lr: 3.0e-4
   weight_decay: 1.0e-2          # NOT applied to the Kendall-Gal log-variances
+  wd_exclude_1d: true           # PROMOTED DEFAULT (2026-06-25): exclude 1-D params
+                                # (LayerNorm / bias / AttnPool-query) from weight decay --
+                                # the standard transformer recipe. Proven win vs the exact
+                                # sw_d192 baseline: rob<=2TeV 1.63%->1.40%, outlier
+                                # 2.05%->1.47%, median-bias -0.73%->-0.05%. Set false to
+                                # recover the EXACT sw_d192 reproduction (all params decayed).
   warmup_epochs: 5
   grad_clip: 5.0
   amp_dtype: bf16               # bf16 | fp32/none (honored; fp16 raises)
