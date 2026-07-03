@@ -4,7 +4,7 @@
 # strict cache (cache_full10) that config/base.yaml points at.
 source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh
 set -uo pipefail
-cd /aifs/user/data/lishanglin/chenhao/transformer_v2cham
+cd /aifs/user/data/lishanglin/chenhao/transformer_v3
 step(){ echo; echo "########## $1 ##########"; }
 
 C=cache_smoke           # throwaway cache (20k events), NOT the shared cache_full10

@@ -19,6 +19,7 @@ import torch
 
 sys.path.insert(0, ".")
 from utils.config import load_config
+from utils.stats import gauss_core
 from data.dataset import EcalTokens, load_meta, make_loader
 from models.model import EcalTransformer
 from losses.objectives import energy_loss, concept_loss, recon_loss
@@ -125,35 +126,41 @@ def validate(model, raw, loader, cfg, device, amp_dtype):
         for k, v in compute_losses(out, batch, cfg, apply_aux_weight=False).items():
             agg.setdefault(k, []).append(float(v) * nb)
     r = np.concatenate(rs); et = np.concatenate(ets)
-    # Model selection on the ROBUST core sigma (IQR/1.349) + MEDIAN bias, restricted to the
-    # reliable range (E <= e_cut). Robust = tail-insensitive => STABLE selection (raw std
-    # bounces with a handful of outliers and conflates core width with tail weight). The
-    # raw std and the outlier fraction are logged SEPARATELY as the tail diagnostics; they
-    # do NOT drive selection -- tails are a data-quality issue, not the energy metric's job.
+    # v3: model selection on the GAUSSIAN CORE sigma (iterative binned fit in mu+/-2sigma,
+    # utils/stats.gauss_core) + the fitted Gaussian mean as the bias, restricted to the
+    # reliable range (E <= e_cut). This is the calorimetry-standard estimator; IQR/1.349
+    # stays as the seed/cross-check column, and raw std / outlier fraction stay as the
+    # tail diagnostics. gauss_core falls back to the robust core if the fit fails (early
+    # epochs), so selection degrades gracefully instead of crashing.
     roll = cfg.loss.get("energy_rolloff", None)
     e_cut = float(roll.get("e_cut", 2000.0)) if roll is not None else 2000.0
     sel = (et <= e_cut) & np.isfinite(r)
     rr = r[sel] if int(sel.sum()) >= 50 else r[np.isfinite(r)]
     q75, q25 = np.percentile(rr, [75, 25])
-    res = float((q75 - q25) / 1.349)                # robust core sigma  (the resolution)
+    res = float((q75 - q25) / 1.349)                # robust core sigma  (cross-check)
     bias = float(np.median(rr))                     # median bias        (robust)
     bias_mean = float(np.mean(rr))                  # mean bias          (raw)
     outlier = float(np.mean(np.abs(rr) > 0.20))     # tail: fraction |dE/E| > 20%
     res_raw = float(np.std(rr))                     # raw std (tail-sensitive)
-    # v2b (a): CONFIGURABLE composite selection metric. Defaults (robust/median/none/0)
-    # reproduce the v2_d192 method exactly; switch core/bias/tail_term/tail_weight to A/B.
+    g = gauss_core(rr)
+    res_gauss = float(g["sigma"])                   # Gaussian core sigma (v3 PRIMARY)
+    bias_gauss = float(g["mu"])                     # fitted Gaussian mean
+    # v2b (a): CONFIGURABLE composite selection metric. v3 defaults core=gauss/bias=gauss;
+    # set core=robust bias=median to reproduce the v2cham selection exactly.
     sm = cfg.train.get("select_metric", None)
-    core_k = sm.get("core", "robust") if sm else "robust"
-    bias_k = sm.get("bias", "median") if sm else "median"
+    core_k = sm.get("core", "gauss") if sm else "gauss"
+    bias_k = sm.get("bias", "gauss") if sm else "gauss"
     tail_k = sm.get("tail_term", "none") if sm else "none"
     tail_w = float(sm.get("tail_weight", 0.0)) if sm else 0.0
-    core = res_raw if core_k == "raw_std" else res
-    bval = {"median": bias, "mean": bias_mean, "none": 0.0}[bias_k]
+    core = {"gauss": res_gauss, "robust": res, "raw_std": res_raw}[core_k]
+    bval = {"gauss": bias_gauss, "median": bias, "mean": bias_mean, "none": 0.0}[bias_k]
     tval = {"none": 0.0, "outlier": outlier, "raw_std": res_raw, "excess": res_raw - res}[tail_k]
     metric = float(np.sqrt(core ** 2 + bval ** 2) + tail_w * tval)   # -> drives selection
     n_total = max(sum(nev), 1)
     means = {k: float(np.sum(v)) / n_total for k, v in agg.items()}
     return {"val_bias": bias, "val_res": res, "val_res_raw": res_raw,
+            "val_res_gauss": res_gauss, "val_bias_gauss": bias_gauss,
+            "val_gauss_ok": int(g["ok"]),
             "val_outlier": outlier, "val_metric": metric,
             **{f"val_{k}": v for k, v in means.items()}}
 
@@ -262,11 +269,15 @@ def main():
 
     # v2b (b): track MULTIPLE "best" checkpoints in one run so the selection-metric effect
     # can be compared post-hoc without retraining. best.pt = configured composite metric
-    # (also drives early stop); best_robust.pt = min robust core; best_raw.pt = min raw std
-    # (the sw_d192-style selection).
-    bests = {"metric": float("inf"), "robust": float("inf"), "raw": float("inf")}
-    bfile = {"metric": "best.pt", "robust": "best_robust.pt", "raw": "best_raw.pt"}
-    bcrit = {"metric": "val_metric", "robust": "val_res", "raw": "val_res_raw"}
+    # (also drives early stop; v3 default = Gaussian core + fitted-mean bias);
+    # best_gauss.pt = min Gaussian core alone; best_robust.pt = min robust core;
+    # best_raw.pt = min raw std (the sw_d192-style selection).
+    bests = {"metric": float("inf"), "gauss": float("inf"),
+             "robust": float("inf"), "raw": float("inf")}
+    bfile = {"metric": "best.pt", "gauss": "best_gauss.pt",
+             "robust": "best_robust.pt", "raw": "best_raw.pt"}
+    bcrit = {"metric": "val_metric", "gauss": "val_res_gauss",
+             "robust": "val_res", "raw": "val_res_raw"}
     bad, header = 0, None
     for epoch in range(cfg.train.epochs):
         model.train()
@@ -318,15 +329,16 @@ def main():
         with open(csv_path, "a", newline="") as f:
             csv.DictWriter(f, header).writerow(row)
         print(f"[{epoch:3d}] train={row['train_total']:.4f} "
-              f"core_res={val['val_res']*100:.2f}% bias={val['val_bias']*100:+.2f}% "
-              f"tail={val['val_outlier']*100:.1f}% metric={val['val_metric']*100:.2f}% "
+              f"gauss={val['val_res_gauss']*100:.2f}%/{val['val_bias_gauss']*100:+.2f}% "
+              f"robust={val['val_res']*100:.2f}% tail={val['val_outlier']*100:.1f}% "
+              f"metric={val['val_metric']*100:.2f}% "
               f"(raw={val['val_res_raw']*100:.2f}%) concept={val['val_concept']:.3f}")
 
         ckpt = {"model": raw.state_dict(), "weighter": weighter.state_dict(),
                 "meta": meta, "config": raw_cfg, "epoch": epoch, "val": val}
         torch.save(ckpt, os.path.join(cfg.paths.out_dir, "last.pt"))
         improved = val["val_metric"] < bests["metric"]      # composite drives early stop
-        for key in ("metric", "robust", "raw"):
+        for key in ("metric", "gauss", "robust", "raw"):
             if val[bcrit[key]] < bests[key]:
                 bests[key] = val[bcrit[key]]
                 torch.save(ckpt, os.path.join(cfg.paths.out_dir, bfile[key]))
@@ -337,8 +349,9 @@ def main():
             if bad >= cfg.train.early_stop_patience:
                 print(f"early stop at epoch {epoch} (best composite {bests['metric']*100:.2f}%)")
                 break
-    print(f"done. best composite={bests['metric']*100:.2f}%  robust={bests['robust']*100:.2f}%  "
-          f"raw={bests['raw']*100:.2f}%  ->  {cfg.paths.out_dir}/{{best,best_robust,best_raw}}.pt")
+    print(f"done. best composite={bests['metric']*100:.2f}%  gauss={bests['gauss']*100:.2f}%  "
+          f"robust={bests['robust']*100:.2f}%  raw={bests['raw']*100:.2f}%  ->  "
+          f"{cfg.paths.out_dir}/{{best,best_gauss,best_robust,best_raw}}.pt")
 
 
 if __name__ == "__main__":

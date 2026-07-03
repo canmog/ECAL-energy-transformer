@@ -2,6 +2,11 @@
 
     python evaluate.py --config config/base.yaml            # uses <out_dir>/best.pt
 
+v3: the PRIMARY resolution estimator is the GAUSSIAN CORE sigma (iterative binned
+fit in mu +/- 2 sigma, utils/stats.gauss_core) with the fitted mean as the bias --
+the same estimator train.py selects checkpoints on. The IQR/1.349 robust core is
+kept as the cross-check; raw std / outlier fraction stay as the tail diagnostics.
+
 Writes metrics.json + resolution_vs_E.png / bias_vs_E.png / scatter.png /
 residual_hist.png to the run's out_dir.
 """
@@ -17,6 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 sys.path.insert(0, ".")
 from utils.config import load_config
+from utils.stats import gauss_core, robust_sigma
 from data.dataset import EcalTokens, load_meta, make_loader
 from models.model import EcalTransformer
 
@@ -30,13 +36,6 @@ def amp_dtype_of(cfg):
     if name in ("fp32", "none"):
         return None
     raise ValueError(f"train.amp_dtype={name!r} unsupported (use bf16 | fp32 | none)")
-
-
-def robust_sigma(x):
-    """Robust Gaussian-core width sigma = IQR/1.349 (tail-insensitive). This is the
-    calorimetry-convention resolution estimator and the SAME one train.py selects on."""
-    q75, q25 = np.percentile(x, [75, 25])
-    return float((q75 - q25) / 1.349)
 
 
 @torch.no_grad()
@@ -58,21 +57,26 @@ def run_model(model, loader, device, amp_dtype):
 
 
 def binned(e_true, r, bins):
-    """Per-bin metrics. PRIMARY = robust core sigma (IQR/1.349) + median bias (the
-    estimator train.py selects on); raw std + mean bias are kept as tail diagnostics."""
-    centers, res, bias, res_raw, bias_raw, counts = [], [], [], [], [], []
+    """Per-bin metrics. v3 PRIMARY = Gaussian core (iterative mu+/-2sigma fit) + fitted
+    mean; robust core (IQR/1.349) is the cross-check; raw std + mean bias diagnostics."""
+    out = {k: [] for k in ("center", "res_gauss", "bias_gauss", "gauss_ok",
+                           "res", "bias", "res_raw", "bias_raw", "count")}
     for lo, hi in zip(bins[:-1], bins[1:]):
         m = (e_true >= lo) & (e_true < hi)
         if m.sum() < 20:
             continue
         rb = r[m]
-        centers.append(0.5 * (lo + hi))
-        res.append(robust_sigma(rb))            # robust core (PRIMARY)
-        bias.append(float(np.median(rb)))       # median bias (robust)
-        res_raw.append(float(np.std(rb)))       # raw std (diagnostic)
-        bias_raw.append(float(np.mean(rb)))     # mean bias (diagnostic)
-        counts.append(int(m.sum()))
-    return map(np.array, (centers, res, bias, res_raw, bias_raw, counts))
+        g = gauss_core(rb)
+        out["center"].append(0.5 * (lo + hi))
+        out["res_gauss"].append(float(g["sigma"]))   # Gaussian core (v3 PRIMARY)
+        out["bias_gauss"].append(float(g["mu"]))     # fitted Gaussian mean
+        out["gauss_ok"].append(int(g["ok"]))
+        out["res"].append(robust_sigma(rb))          # robust core (cross-check)
+        out["bias"].append(float(np.median(rb)))     # median bias (robust)
+        out["res_raw"].append(float(np.std(rb)))     # raw std (diagnostic)
+        out["bias_raw"].append(float(np.mean(rb)))   # mean bias (diagnostic)
+        out["count"].append(int(m.sum()))
+    return {k: np.array(v) for k, v in out.items()}
 
 
 def main():
@@ -98,7 +102,7 @@ def main():
     r = (e_pred - e_true) / np.clip(e_true, 1e-3, None)
 
     bins = np.array(cfg.eval.energy_bins, dtype=float)
-    centers, res, bias, res_raw, bias_raw, counts = binned(e_true, r, bins)
+    b = binned(e_true, r, bins)
 
     # per-concept resolution (de-standardise to raw 3D-fit units; subset-aware)
     cstd = np.asarray(test_ds.cstd); cmean = np.asarray(test_ds.cmean)
@@ -116,50 +120,61 @@ def main():
     roll = cfg.loss.get("energy_rolloff", None)
     e_cut = float(roll.get("e_cut", 2000.0)) if roll is not None else 2000.0
     m2 = e_true <= e_cut
-    le2 = centers <= e_cut
+    le2 = b["center"] <= e_cut
+    g_all = gauss_core(r)
+    g_cut = gauss_core(r[m2]) if m2.any() else None
     metrics = {
         "n_test": int(len(e_true)),
-        "sigma_estimator": "robust_core_iqr/1.349",
-        # PRIMARY metrics: robust core sigma (IQR/1.349) + median bias -- the SAME
-        # estimator train.py selects checkpoints on, so eval and selection now agree.
+        "sigma_estimator": "gauss_core_iter2sigma",
+        # PRIMARY metrics (v3): Gaussian core sigma + fitted-mean bias -- the SAME
+        # estimator train.py selects checkpoints on, so eval and selection agree.
+        "overall_res_gauss": float(g_all["sigma"]), "overall_bias_gauss": float(g_all["mu"]),
+        "gauss_ok": int(g_all["ok"]),
+        "bias_aware_metric_gauss": float(np.hypot(g_all["sigma"], g_all["mu"])),
+        "binwise_mean_res_gauss": float(np.mean(b["res_gauss"])) if len(b["res_gauss"]) else None,
+        "overall_res_gauss_le_cut": float(g_cut["sigma"]) if g_cut else None,
+        "binwise_mean_res_gauss_le_cut": (float(np.mean(b["res_gauss"][le2]))
+                                          if le2.any() else None),
+        # CROSS-CHECK: robust core (IQR/1.349) + median bias (the v2 primary).
         "overall_res": robust_sigma(r), "overall_bias": float(np.median(r)),
         "bias_aware_metric": float(np.sqrt(robust_sigma(r) ** 2 + np.median(r) ** 2)),
-        "binwise_mean_res": float(np.mean(res)) if len(res) else None,
+        "binwise_mean_res": float(np.mean(b["res"])) if len(b["res"]) else None,
         "overall_res_le_cut": robust_sigma(r[m2]) if m2.any() else None,
-        "binwise_mean_res_le_cut": float(np.mean(res[le2])) if le2.any() else None,
+        "binwise_mean_res_le_cut": float(np.mean(b["res"][le2])) if le2.any() else None,
         # DIAGNOSTICS: raw std + mean bias (tail-sensitive legacy definition) and the
         # outlier fraction that quantifies the non-Gaussian tail separately.
         "overall_res_raw_std": float(np.std(r)), "overall_bias_mean": float(np.mean(r)),
-        "binwise_mean_res_raw_std": float(np.mean(res_raw)) if len(res_raw) else None,
+        "binwise_mean_res_raw_std": float(np.mean(b["res_raw"])) if len(b["res_raw"]) else None,
         "overall_res_le_cut_raw_std": float(np.std(r[m2])) if m2.any() else None,
         "outlier_frac": float(np.mean(np.abs(r) > 0.20)),
         "e_cut_gev": e_cut,
         "recon_logmse": float(np.mean(rerr)),
-        "bins": {"center": centers.tolist(), "res": res.tolist(), "bias": bias.tolist(),
-                 "res_raw": res_raw.tolist(), "bias_raw": bias_raw.tolist(),
-                 "count": counts.tolist()},
+        "bins": {k: v.tolist() for k, v in b.items()},
         "concepts": concept_metrics,
     }
     with open(os.path.join(cfg.paths.out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     print(json.dumps({k: metrics[k] for k in
-          ["overall_res", "overall_bias", "binwise_mean_res",
-           "overall_res_le_cut", "binwise_mean_res_le_cut",
-           "overall_res_raw_std", "recon_logmse"]}, indent=2))
-    print("(overall_res = robust core IQR/1.349; overall_res_raw_std = legacy std)")
+          ["overall_res_gauss", "overall_bias_gauss", "overall_res_gauss_le_cut",
+           "binwise_mean_res_gauss", "overall_res", "overall_res_le_cut",
+           "overall_res_raw_std", "outlier_frac", "recon_logmse"]}, indent=2))
+    print("(overall_res_gauss = Gaussian core, iterative +/-2sigma fit; "
+          "overall_res = robust core IQR/1.349; overall_res_raw_std = legacy std)")
     print("concept R^2:", {k: round(v["r2"], 3) for k, v in concept_metrics.items()})
 
     od = cfg.paths.out_dir
     plt.figure()
-    plt.plot(centers, np.array(res) * 100, "o-", label="robust core (IQR/1.349)")
-    plt.plot(centers, np.array(res_raw) * 100, "s--", alpha=.45, label="raw std")
+    plt.plot(b["center"], b["res_gauss"] * 100, "o-", label="Gaussian core (+/-2$\\sigma$ fit)")
+    plt.plot(b["center"], b["res"] * 100, "d-", alpha=.6, label="robust core (IQR/1.349)")
+    plt.plot(b["center"], b["res_raw"] * 100, "s--", alpha=.45, label="raw std")
     plt.legend(); plt.xscale("log"); plt.xlabel("E_true [GeV]"); plt.ylabel("sigma/E [%]")
     plt.title("Energy resolution"); plt.grid(True, alpha=.3)
     plt.savefig(os.path.join(od, "resolution_vs_E.png"), dpi=130, bbox_inches="tight"); plt.close()
 
     plt.figure(); plt.axhline(0, color="k", lw=.8)
-    plt.plot(centers, np.array(bias) * 100, "s-", label="median bias")
-    plt.plot(centers, np.array(bias_raw) * 100, "^--", alpha=.45, label="mean bias")
+    plt.plot(b["center"], b["bias_gauss"] * 100, "o-", label="Gaussian-fit mean")
+    plt.plot(b["center"], b["bias"] * 100, "s-", alpha=.6, label="median bias")
+    plt.plot(b["center"], b["bias_raw"] * 100, "^--", alpha=.45, label="mean bias")
     plt.legend(); plt.xscale("log"); plt.xlabel("E_true [GeV]"); plt.ylabel("bias [%]")
     plt.title("Energy bias"); plt.grid(True, alpha=.3)
     plt.savefig(os.path.join(od, "bias_vs_E.png"), dpi=130, bbox_inches="tight"); plt.close()
@@ -170,10 +185,19 @@ def main():
     plt.xlabel("E_true [GeV]"); plt.ylabel("E_pred [GeV]"); plt.title("DNN energy")
     plt.savefig(os.path.join(od, "scatter.png"), dpi=130, bbox_inches="tight"); plt.close()
 
-    plt.figure(); plt.hist(r, bins=120, range=(-0.3, 0.3))
+    plt.figure()
+    plt.hist(r, bins=120, range=(-0.3, 0.3), density=False)
+    # overlay the fitted Gaussian core so the fit quality is visible
+    xs = np.linspace(-0.3, 0.3, 400)
+    n_in = np.sum((r > -0.3) & (r < 0.3))
+    scale = n_in * (0.6 / 120)
+    plt.plot(xs, scale / (np.sqrt(2*np.pi) * g_all["sigma"])
+             * np.exp(-0.5 * ((xs - g_all["mu"]) / g_all["sigma"]) ** 2),
+             "r-", lw=1.2, label="Gaussian core fit")
+    plt.legend()
     plt.xlabel("(E_pred - E_true)/E_true"); plt.title(
-        f"core={robust_sigma(r)*100:.2f}% (IQR/1.349)  med-bias={np.median(r)*100:+.2f}%"
-        f"  raw-std={np.std(r)*100:.2f}%")
+        f"gauss core={g_all['sigma']*100:.2f}% (mu={g_all['mu']*100:+.2f}%)  "
+        f"robust={robust_sigma(r)*100:.2f}%  raw-std={np.std(r)*100:.2f}%")
     plt.savefig(os.path.join(od, "residual_hist.png"), dpi=130, bbox_inches="tight"); plt.close()
     print("wrote metrics.json + 4 plots ->", od)
 

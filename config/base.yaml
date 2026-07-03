@@ -1,15 +1,18 @@
 # ============================================================================
-# transformer_v2cham/ — CHAMPION: wdx + v2m1 + v2b (multi-best / configurable selection)
+# transformer_v3/ — champion model + GAUSSIAN-CORE selection & evaluation
 #
-# Stacks the two proven orthogonal wins on the sw_d192 model and runs them inside the v2b
-# selection framework, so ONE run yields the best checkpoint on each axis:
-#   * wdx          -> wd_exclude_1d=true  (exclude 1-D params from weight decay; best core)
-#   * v2m1         -> loss.fit_quality_weight (down-weight concept+recon on poorly-fit
-#                     events; best raw-std tail)
-#   * v2b (a)+(b)  -> train.select_metric (composite; tail_weight=0 here) + multi-best
-#                     checkpoints best.pt / best_robust.pt / best_raw.pt
-# Pick best_robust.pt for the robust core, best_raw.pt for the tail (raw-std is noisy, so
-# multi-best beats tuning a tail_weight). Reuses cache_full10; d192; 50 epochs.
+# Same trained objective as transformer_v2cham (wdx + v2m1 fit-quality weighting on the
+# sw_d192 model); what changes is the RESOLUTION ESTIMATOR: the primary sigma/E is now
+# the Gaussian core from an iterative +/-2 sigma binned fit (utils/stats.gauss_core,
+# the calorimetry-standard ROOT-style estimator), used BOTH for checkpoint selection
+# (train.select_metric core=gauss, bias=gauss -> best.pt/early stop) AND as the primary
+# number in evaluate.py. IQR/1.349 stays as the cross-check; raw std / outlier fraction
+# stay as tail diagnostics. Multi-best now saves best.pt / best_gauss.pt /
+# best_robust.pt / best_raw.pt from one training.
+#
+# Also in v3: the capacity re-check (d256/d320 with lr scaled down; job_v3_d256/320.sub),
+# the checkpoint re-scorer (rescore_gauss.py) and the catastrophic-event profiler
+# (outlier_study.py).
 #
 # What "sw_d192 baseline" means, concretely (vs. the dual_v1 build it was forked
 # from): plain energy head, residual bypass ON, ALL 11 concepts, Kendall-Gal
@@ -36,7 +39,7 @@ paths:
   # re-preprocess 3.38M events. Override with --set paths.cache_dir=... to rebuild
   # a private cache here.
   cache_dir: /aifs/user/data/lishanglin/chenhao/transformer/cache_full10
-  out_dir:   /aifs/user/data/lishanglin/chenhao/transformer_v2cham/runs/v2cham_d192
+  out_dir:   /aifs/user/data/lishanglin/chenhao/transformer_v3/runs/v3_d192
 
 data:
   target_branch: mcEne          # MC truth energy (GeV)
@@ -144,14 +147,14 @@ train:
   lr: 3.0e-4
   weight_decay: 1.0e-2          # NOT applied to the Kendall-Gal log-variances
   wd_exclude_1d: true           # CHAMPION: the wdx win (exclude 1-D params from weight decay).
-  # v2b (a): CONFIGURABLE composite checkpoint-selection metric. With tail_weight=0 +
-  # core=robust + bias=median this is EXACTLY the v2_d192 method; raise tail_weight or
-  # switch core/tail_term to A/B a tail-aware selection. Drives best.pt + early stop.
-  #   core:      robust | raw_std
-  #   bias:      median | mean | none
+  # v3: composite checkpoint-selection metric now defaults to the GAUSSIAN CORE
+  # (iterative +/-2 sigma fit) + the fitted Gaussian mean as the bias. Set
+  # core=robust bias=median to reproduce the v2cham selection exactly.
+  #   core:      gauss | robust | raw_std
+  #   bias:      gauss | median | mean | none
   #   tail_term: none | outlier | raw_std | excess   (excess = raw_std - robust)
   #   metric = sqrt(core^2 + bias^2) + tail_weight * tail_term
-  select_metric: {core: robust, bias: median, tail_term: none, tail_weight: 0.0}
+  select_metric: {core: gauss, bias: gauss, tail_term: none, tail_weight: 0.0}
   warmup_epochs: 5
   grad_clip: 5.0
   amp_dtype: bf16               # bf16 | fp32/none (honored; fp16 raises)

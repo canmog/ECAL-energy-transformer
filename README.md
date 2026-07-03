@@ -1,36 +1,46 @@
-# transformer_v2cham/ — champion: wdx + v2m1 + v2b framework
+# transformer_v3 — Gaussian-core selection & evaluation
 
-Stacks the two proven, **orthogonal** wins on the `sw_d192` model and runs them inside the
-`v2b` selection framework, so a single run produces the best checkpoint on each axis:
+Fork of `transformer_v2cham` (the champion: wdx + v2m1 fit-quality weighting on the
+`sw_d192` model). The trained objective is UNCHANGED; v3 changes the **resolution
+estimator** and adds the capacity re-check and two analysis tools.
 
-| ingredient | from | effect |
-|------------|------|--------|
-| `wd_exclude_1d: true` | wdx | exclude 1-D params (LayerNorm/bias/AttnPool-query) from weight decay → best robust core + calibration |
-| `loss.fit_quality_weight` | v2m1 | down-weight concept+recon on poorly-fit events (token-level residual) → suppresses the raw-std tail |
-| `train.select_metric` + multi-best ckpts | v2b | composite selection (`tail_weight=0` here) + saves `best.pt` / `best_robust.pt` / `best_raw.pt` |
+## What's new vs v2cham
 
-## Why this should be the new best
+* `utils/stats.py::gauss_core` — the calorimetry-standard **Gaussian core sigma**:
+  binned Gaussian fit restricted to `mu +/- 2 sigma`, iterated until the fitted sigma
+  is stable (seeded from median + IQR/1.349; corrected-truncated-moments fallback,
+  then robust fallback — never crashes on a weird epoch-0 distribution).
+* `train.py` — validation logs `val_res_gauss` / `val_bias_gauss`; the selection
+  metric supports `core: gauss`, `bias: gauss` (the v3 default); multi-best now also
+  saves `best_gauss.pt` (min Gaussian core alone) next to best/best_robust/best_raw.
+* `evaluate.py` — Gaussian core (overall / <=2 TeV / per-bin) is the PRIMARY metric
+  (`overall_res_gauss`, `sigma_estimator: gauss_core_iter2sigma`); robust core stays
+  as the cross-check; raw std + outlier fraction stay as tail diagnostics. The
+  residual histogram now overlays the fitted Gaussian core.
+* `rescore_gauss.py` — re-scores every saved v2-lineage checkpoint + the 3D-fit
+  anchor (`cache_m2:anchor` = kx_EneL2Cor) with all three estimators on the SAME
+  cache_full10 test split; writes `runs/rescore/rescore_gauss.{json,md}`.
+* `outlier_study.py` — profiles the |dE/E|>20% (and >100%) events of a chosen
+  checkpoint against per-event physics variables (E, tokens, deposited energy,
+  max-cell fraction, fit residual, first/last layer, the 11 concepts, |slope|,
+  edge distance); writes `runs/outliers/outliers.md` + rate plots + worst-100 CSV.
 
-- `wdx+v2m1` already gave the best robust core (1.38% ≤2 TeV) and best calibration; here it
-  also gets a **raw-selected checkpoint** for the tail, for free, from the same run.
-- On raw-std being noisy: rather than tuning a `tail_weight`, we rely on **multi-best** —
-  `best_raw.pt` is the lightest-tail epoch of the best model. (Optional later A/B:
-  `select_metric.tail_term=excess, tail_weight≈0.3`.)
+## Jobs
 
-## Pick the checkpoint per metric
+| job | what |
+|---|---|
+| `job_rescore.sub`  | rescore all checkpoints + champion outlier profile (no training) |
+| `job_v3_d192.sub`  | champion objective + gauss selection, d192 (A/B vs v2cham: selection estimator only) |
+| `job_v3_d256.sub`  | capacity re-check, d256, lr 2e-4 |
+| `job_v3_d320.sub`  | capacity re-check, d320, lr 1.5e-4 |
 
-- `best_robust.pt` → robust core (expected ~1.38% ≤2 TeV);
-- `best_raw.pt`    → raw-std tail (lightest-tail epoch of this model);
-- `best.pt`        → bias-aware robust composite (drives early stop).
+Estimator definitions: gauss = iterative +/-2 sigma binned fit; robust = IQR/1.349;
+raw = np.std. Outlier = fraction |dE/E| > 20%. All selection restricted to E <= 2 TeV.
 
-`job_v2cham.sub` trains once then evaluates all three into `metrics_<ck>.json`.
+## Evaluation precision (found 2026-07-02)
 
-## Run
-
-```bash
-sbatch job_v2cham.sub        # train (multi-best) -> eval 3 ckpts -> probe; cache_full10, d192, 50 ep
-bash   smoke_test.sh         # 2-epoch end-to-end check on a private throwaway cache
-```
-
-See `../transformer_v2/EXPERIMENT_LOG.md` for the full sweep and `../transformerReport/` for
-the study.
+bf16 inference adds a median 0.38% per-event energy perturbation, inflating the
+Gaussian core by 5-13% relative (measured A/B: 1.12 -> 1.26% at 1-2 TeV). Training
+stays bf16, but EVALUATION is fp32: the v3 job files pass `train.amp_dtype=fp32` to
+evaluate.py, and `rescore_gauss.py --fp32` re-scores historical checkpoints without
+the penalty. Historical (v1/v2) numbers are bf16-evaluated.
