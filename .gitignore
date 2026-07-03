@@ -1,0 +1,15 @@
+# training artifacts — regenerable, live in runs/ next to the code on each machine
+runs/
+cache*/
+*.pt
+*.pth
+*.npz
+*.npy
+*.root
+slurm-*.out
+# python
+__pycache__/
+*.pyc
+# editor / tooling
+*.swp
+.claude/

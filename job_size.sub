@@ -1,0 +1,28 @@
+#!/bin/bash
+#SBATCH --job-name=tf_run
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=2-00:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+# Generic single-size training+eval job, run from any model folder. Submit with:
+#   sbatch --job-name=<n> --export=ALL,NAME=<n>,DM=<d_model>,DF=<d_free>[,CACHE=<dir>] job_size.sub
+cd "$SLURM_SUBMIT_DIR" || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+set -o pipefail
+CFG=config/base.yaml
+NAME=${NAME:?need NAME}; DM=${DM:?need DM}; DF=${DF:?need DF}; EPOCHS=${EPOCHS:-100}
+CACHEOPT=""; [ -n "$CACHE" ] && CACHEOPT="paths.cache_dir=$CACHE"
+mkdir -p runs/$NAME
+echo "##### [$(date '+%F %T')] TRAIN $NAME : d_model=$DM d_free=$DF epochs=$EPOCHS cache=${CACHE:-config-default} #####"
+python train.py    --config $CFG --set paths.out_dir=runs/$NAME $CACHEOPT \
+    model.d_model=$DM model.d_free=$DF model.dropout=0.05 train.epochs=$EPOCHS 2>&1 \
+    | tee runs/$NAME/train.log | tail -8
+echo "##### [$(date '+%F %T')] EVAL $NAME #####"
+python evaluate.py --config $CFG --set paths.out_dir=runs/$NAME $CACHEOPT \
+    model.d_model=$DM model.d_free=$DF 2>&1 | tee runs/$NAME/eval.log | tail -5
+echo "##### DONE $NAME $(date '+%F %T') #####"

@@ -1,0 +1,53 @@
+#!/bin/bash
+#SBATCH --job-name=tf_sweep
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
+#SBATCH --time=2-00:00:00
+#SBATCH --output=/aifs/user/data/lishanglin/chenhao/transformer/runs/slurm-sweep-%j.out
+# Complete-data sweep over a few s9-style (efficient) parameter sets.
+# Override via sbatch --export=ALL,CACHE=...,ME=...,EPOCHS=... for a quick test.
+cd /aifs/user/data/lishanglin/chenhao/transformer || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+set -o pipefail
+CFG=config/base.yaml
+CACHE=${CACHE:-cache_full10}          # full mode caches the complete sample here
+EPOCHS=${EPOCHS:-50}
+MEOPT=""; [ -n "$ME" ] && MEOPT="data.max_events=$ME"
+echo "##### [$(date '+%F %T')] node=$(hostname) CACHE=$CACHE EPOCHS=$EPOCHS ME=${ME:-ALL} #####"
+
+echo "##### PREPROCESS $CACHE (complete data, 10 MeV cut, single-shower, 11 concepts) #####"
+if [ -f "$CACHE/meta.json" ]; then
+  echo "cache exists -> skip preprocess"
+else
+  python -m data.preprocess --config $CFG --set paths.cache_dir=$CACHE $MEOPT 2>&1 \
+    | tee runs/preprocess_$CACHE.log | tail -6 \
+    || { echo "PREPROCESS_FAILED"; exit 2; }
+fi
+
+run_cfg() {                            # name <model/train overrides...>
+  local name=$1; shift
+  mkdir -p runs/$name
+  echo "##### [$(date '+%F %T')] TRAIN $name : $* #####"
+  if python train.py --config $CFG --set paths.cache_dir=$CACHE paths.out_dir=runs/$name \
+        train.epochs=$EPOCHS "$@" 2>&1 | tee runs/$name/train.log | tail -6; then
+    python evaluate.py --config $CFG --set paths.cache_dir=$CACHE paths.out_dir=runs/$name "$@" 2>&1 \
+        | tee runs/$name/eval.log | tail -4
+    echo "##### $name DONE #####"
+  else
+    echo "##### !! $name FAILED (continuing to next config) #####"
+  fi
+}
+
+# s9-style efficient sweep (dropout 0.05; smaller models generalised best in your sweeps)
+run_cfg sw_d128       model.d_model=128 model.d_free=64  model.dropout=0.05
+run_cfg sw_d128_lr1e4 model.d_model=128 model.d_free=64  model.dropout=0.05 train.lr=1.0e-4
+run_cfg sw_d96        model.d_model=96  model.d_free=48  model.dropout=0.05
+run_cfg sw_d192       model.d_model=192 model.d_free=128 model.dropout=0.05
+
+echo "##### [$(date '+%F %T')] SWEEP_DONE #####"
+python summarize_runs.py 2>&1 | tail -20

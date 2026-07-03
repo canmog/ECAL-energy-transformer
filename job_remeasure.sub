@@ -1,0 +1,20 @@
+#!/bin/bash
+#SBATCH --job-name=tf_remeas
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=00:40:00
+#SBATCH --output=runs/slurm-%x-%j.out
+# Re-evaluate saved checkpoints with robust IQR/1.349 sigma (+ raw std). NO training.
+cd "$SLURM_SUBMIT_DIR" || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+B=/aifs/user/data/lishanglin/chenhao
+echo "##### START $(hostname) $(date '+%F %T') #####"
+cd $B/transformer        && python _remeasure.py runs/sw_d192 runs/abl runs/dual_v1 runs/s9_smalld05
+cd $B/transformer_m4     && python $B/transformer/_remeasure.py runs/m4
+cd $B/transformer_m2     && python $B/transformer/_remeasure.py runs/m2
+echo "##### REMEASURE_DONE $(date '+%F %T') #####"
