@@ -264,6 +264,11 @@ def main():
     sched = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cos], [cfg.train.warmup_epochs])
 
     csv_path = os.path.join(cfg.paths.out_dir, "metrics.csv")
+    # code provenance: GIT_VERSION is written by the repo's post-commit hook on the
+    # dev machine and reaches the server via Mutagen (the server has no .git).
+    if os.path.exists("GIT_VERSION"):
+        with open("GIT_VERSION") as f:
+            raw_cfg["git_version"] = f.read().strip()
     with open(os.path.join(cfg.paths.out_dir, "config.json"), "w") as f:
         json.dump(raw_cfg, f, indent=2)
 

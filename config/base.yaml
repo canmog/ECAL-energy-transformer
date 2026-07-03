@@ -39,7 +39,7 @@ paths:
   # re-preprocess 3.38M events. Override with --set paths.cache_dir=... to rebuild
   # a private cache here.
   cache_dir: /aifs/user/data/lishanglin/chenhao/transformer/cache_full10
-  out_dir:   /aifs/user/data/lishanglin/chenhao/transformer_v3/runs/v3_d192
+  out_dir:   /aifs/user/data/lishanglin/chenhao/ecalTransformer/runs/v3_d192
 
 data:
   target_branch: mcEne          # MC truth energy (GeV)
