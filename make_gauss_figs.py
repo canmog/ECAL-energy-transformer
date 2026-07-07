@@ -38,12 +38,14 @@ CACHE = f"{BASE}/transformer/cache_full10"
 # fp32 re-scoring = the numbers of record; rescore_d320 overrides the v3_d320 row
 # that the main fp32 pass caught mid-training (epoch 10).
 RESCORE = f"{BASE}/transformer_v3/runs/rescore_fp32/rescore_gauss.json"
-RESCORE_EXTRA = f"{BASE}/transformer_v3/runs/rescore_d320/rescore_gauss.json"
+RESCORE_EXTRAS = [f"{BASE}/transformer_v3/runs/rescore_d320/rescore_gauss.json",
+                  f"{BASE}/ecalTransformer/runs/rescore_ep100/rescore_gauss.json"]
 OUT = f"{BASE}/transformerReport/figs"
 DISPLAY_BINS = [(50, 100), (300, 500), (1000, 2000), (3000, 4000)]
 
 STYLE = {  # label -> (rescore key, color, marker, linestyle)
-    "v2cham (champion)": ("v2cham_best", "#2ca02c", "D", "-"),
+    "v3 ep100 (new champion)": ("v3_ep100", "#d62728", "P", "-"),
+    "v2cham (50 ep)":    ("v2cham_best", "#2ca02c", "D", "-"),
     "sw_d192 (v1 best)": ("sw_d192", "#1f77b4", "s", "--"),
     "m1_d320":           ("m1_d320", "#9467bd", "v", "-."),
     "3D fit (kx_EneL2Cor)": ("3dfit_EneL2Cor", "#7f7f7f", "o", "-"),
@@ -84,7 +86,7 @@ def fig_summary(res):
 
     # ---- f10: estimator effect, champion vs 3D fit
     fig, axes = plt.subplots(1, 2, figsize=(9.6, 4.2))
-    for ax, lab in zip(axes, ["v2cham (champion)", "3D fit (kx_EneL2Cor)"]):
+    for ax, lab in zip(axes, ["v2cham (50 ep)", "3D fit (kx_EneL2Cor)"]):
         key = STYLE[lab][0]
         c, v = bins_of(res, key)
         ax.plot(c, v["gauss"] * 100, "o-", color="#2ca02c", ms=4, label=r"Gaussian core ($\pm2\sigma$ fit)")
@@ -268,10 +270,11 @@ def main():
     args = ap.parse_args()
     with open(RESCORE) as f:
         res = json.load(f)["results"]
-    if os.path.exists(RESCORE_EXTRA):        # final v3_d320 (+extra v3 checkpoints)
-        with open(RESCORE_EXTRA) as f:
-            extra = json.load(f)["results"]
-        res.update({k: v for k, v in extra.items() if k != "3dfit_EneL2Cor"})
+    for extra_path in RESCORE_EXTRAS:        # final v3_d320, v3 ep100, ...
+        if os.path.exists(extra_path):
+            with open(extra_path) as f:
+                extra = json.load(f)["results"]
+            res.update({k: v for k, v in extra.items() if k != "3dfit_EneL2Cor"})
     if args.summary:
         fig_summary(res)
     if args.fits:
