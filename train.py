@@ -33,8 +33,10 @@ torch.set_float32_matmul_precision("high")
 def build_loaders(cfg, meta):
     cd = cfg.paths.cache_dir
     cu = cfg.data.get("concept_use", None)
+    # data.train_e_max: TRAIN-only energy holdout (extrapolation test). Validation keeps
+    # the full range — the selection metric is already restricted to E <= e_cut.
     tr = EcalTokens(cd, "train", meta, train=True, augment=cfg.train.augment.to_dict(),
-                    concept_use=cu)
+                    concept_use=cu, e_max=cfg.data.get("train_e_max", None))
     va = EcalTokens(cd, "val", meta, train=False, concept_use=cu)
     return (make_loader(tr, cfg, shuffle=True, seed=cfg.seed),
             make_loader(va, cfg, shuffle=False))

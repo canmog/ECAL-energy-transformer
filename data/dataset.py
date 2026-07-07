@@ -22,7 +22,8 @@ TOKEN_FEATURE_DIM = 1 + GEOM_FEATURE_DIM   # log1p(E) + geometry block
 
 
 class EcalTokens(Dataset):
-    def __init__(self, cache_dir, split, meta, train=False, augment=None, concept_use=None):
+    def __init__(self, cache_dir, split, meta, train=False, augment=None, concept_use=None,
+                 e_max=None):
         self.train = train
         self.aug = augment or {}
         z = np.load(os.path.join(cache_dir, f"{split}.npz"))
@@ -33,6 +34,23 @@ class EcalTokens(Dataset):
         self.expe = z["tok_expe"].astype(np.float32)
         self.energy = z["energy"].astype(np.float32)
         concepts = z["concepts"].astype(np.float32)
+
+        # e_max (data.train_e_max): drop events above an energy cut AT LOAD TIME — the
+        # held-out-TeV extrapolation test (train <=e_max, evaluate the full range).
+        # CSR filter: keep per-event, repeat onto tokens, rebuild offsets. Energy/concept
+        # standardisation stays the FULL-train meta (constants, deliberately unchanged).
+        if e_max is not None:
+            keep = self.energy <= float(e_max)
+            counts = np.diff(self.off)
+            tok_keep = np.repeat(keep, counts)
+            self.layer, self.cell = self.layer[tok_keep], self.cell[tok_keep]
+            self.ehit, self.expe = self.ehit[tok_keep], self.expe[tok_keep]
+            self.energy = self.energy[keep]
+            concepts = concepts[keep]
+            off = np.zeros(int(keep.sum()) + 1, dtype=np.int64)
+            np.cumsum(counts[keep], out=off[1:])
+            self.off = off
+            print(f"[dataset:{split}] e_max={e_max} GeV: kept {int(keep.sum())}/{len(keep)} events")
 
         # v2m1: per-event 3D-fit goodness = token-level relative residual
         #   resid = sum|ehit - expe| / (sum ehit + eps)
