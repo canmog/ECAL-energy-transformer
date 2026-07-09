@@ -13,7 +13,16 @@
 # seed, so the test set is identical). Submit with:  sbatch --export=ALL,SEED=<n> ...
 # Gives the error bar that the 1.14% headline number needs.
 cd "$SLURM_SUBMIT_DIR" || exit 1
+# stagger concurrent starts (two same-second env loads once produced a silent
+# conda-activation failure -> ModuleNotFoundError: torch), then VERIFY the env
+# loudly instead of trusting the silenced source.
+sleep $((SLURM_JOB_ID % 47))
 source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+if ! python -c "import torch" 2>/dev/null; then
+  echo "[warn] env load failed; retrying once"; sleep 60
+  source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+  python -c "import torch" || { echo "!! ENV LOAD FAILED TWICE"; exit 9; }
+fi
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 set -o pipefail
 SEED=${SEED:?submit with --export=ALL,SEED=<n>}
