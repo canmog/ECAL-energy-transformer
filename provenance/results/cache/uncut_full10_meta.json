@@ -1,0 +1,160 @@
+{
+  "complete": true,
+  "cache_layout": "split_npy_memmap_v1",
+  "n_concepts": 11,
+  "concept_names": [
+    "shwr_x0",
+    "shwr_y0",
+    "shwr_z0",
+    "shwr_kx",
+    "shwr_ky",
+    "shwr_a0",
+    "frac_lat",
+    "frac_rear",
+    "tmax",
+    "lat_width",
+    "long_width"
+  ],
+  "concept_reflect_x": [
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "concept_reflect_y": [
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "concept_coord": [
+    "x",
+    "y",
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "concept_mean": [
+    -0.18807072087432702,
+    -0.18910337317237402,
+    -149.8239249744169,
+    -0.000516848857994317,
+    -0.00018705057308969042,
+    -139.9466284746752,
+    0.013296731290159873,
+    0.07846863729562471,
+    7.924300145530371,
+    2.0369379047731697,
+    3.4639404005738355
+  ],
+  "concept_std": [
+    19.339108291127715,
+    19.48322673957004,
+    3.661513519788024,
+    0.2969021957483753,
+    0.3010340090054387,
+    1.7679507592007795,
+    0.030692531809724567,
+    0.10229499605135238,
+    3.025661370983827,
+    0.7095003472238942,
+    0.39378767985329016
+  ],
+  "concept_finite_train_count": [
+    4306191,
+    4306191,
+    4306191,
+    4306191,
+    4306191,
+    4306191,
+    4306191,
+    4306191,
+    4306191,
+    4306191,
+    4306191
+  ],
+  "log_energy_mean": 6.256463131303824,
+  "log_energy_std": 1.381132674277506,
+  "log_energy_finite_train_count": 4306191,
+  "angle_names": [
+    "mc_kx",
+    "mc_ky"
+  ],
+  "angle_mean": [
+    0.0017264874335475569,
+    0.001887545229392122
+  ],
+  "angle_std": [
+    0.30892905739918575,
+    0.31184031431543513
+  ],
+  "angle_finite_train_count": [
+    4306191,
+    4306191
+  ],
+  "angle_reflect_x": [
+    -1,
+    1
+  ],
+  "angle_reflect_y": [
+    1,
+    -1
+  ],
+  "threshold_mev": 10.0,
+  "cell_scale": 1000.0,
+  "geometry_data_type": "MC",
+  "selection": {
+    "require_truth": false,
+    "require_angle_truth": false,
+    "select_contained": false,
+    "select_single_shower": false,
+    "require_positive_ref": false,
+    "pid_electron_only": false
+  },
+  "raw_events_seen": 17743152,
+  "retained_events": 6151699,
+  "dropped_by_selection_or_zero_tokens": 11591453,
+  "split_seed": 42,
+  "split_sizes": {
+    "train": {
+      "events": 4306191,
+      "tokens": 1856567618
+    },
+    "val": {
+      "events": 922754,
+      "tokens": 397586317
+    },
+    "test": {
+      "events": 922754,
+      "tokens": 398311338
+    }
+  },
+  "quality_fields": {
+    "fit_status": "kx_ShwrStat[0]",
+    "n_shower": "kx_N_Shwr",
+    "old_selection": "(fit_status & 7) == 7 and n_shower == 1"
+  },
+  "cutflow_cumulative": {
+    "input": 17743152
+  }
+}
