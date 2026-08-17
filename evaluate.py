@@ -1,205 +1,440 @@
-"""Evaluate a trained model on the test split.
+"""Evaluate ECAL incidence direction against MC truth and the 3D-fit baseline.
 
-    python evaluate.py --config config/base.yaml            # uses <out_dir>/best.pt
-
-v3: the PRIMARY resolution estimator is the GAUSSIAN CORE sigma (iterative binned
-fit in mu +/- 2 sigma, utils/stats.gauss_core) with the fitted mean as the bias --
-the same estimator train.py selects checkpoints on. The IQR/1.349 robust core is
-kept as the cross-check; raw std / outlier fraction stay as the tail diagnostics.
-
-Writes metrics.json + resolution_vs_E.png / bias_vs_E.png / scatter.png /
-residual_hist.png to the run's out_dir.
+Inference is deliberately fp32. Primary resolution is the 68% containment of the
+3D opening angle, reported in degrees by the production config; angular-error
+distributions are radial/non-negative,
+so the energy project's Gaussian residual-core estimator is not applicable.
 """
 import argparse
 import json
 import os
 import sys
 
-import numpy as np
-import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
 sys.path.insert(0, ".")
-from utils.config import load_config
-from utils.stats import gauss_core, robust_sigma
 from data.dataset import EcalTokens, load_meta, make_loader
 from models.model import EcalTransformer
+from utils.angle import (angular_error_np, containment_summary,
+                         slopes_to_unit_np)
+from utils.config import load_config
+from utils.stats import gauss_core
 
 
-def amp_dtype_of(cfg):
-    """Honor train.amp_dtype: bf16 -> autocast bf16; fp32/none -> no autocast.
-    (Mirrors train.py so eval runs at the SAME precision the model trained in.)"""
-    name = str(cfg.train.get("amp_dtype", "bf16")).lower()
-    if name == "bf16":
-        return torch.bfloat16
-    if name in ("fp32", "none"):
-        return None
-    raise ValueError(f"train.amp_dtype={name!r} unsupported (use bf16 | fp32 | none)")
+def robust_sigma(values):
+    q25, q75 = np.quantile(values, [0.25, 0.75])
+    return float((q75 - q25) / 1.349)
+
+
+def load_optional_split_array(cache_dir, split, name):
+    """Load a small optional event-level field from either cache layout."""
+    path = os.path.join(cache_dir, split, f"{name}.npy")
+    if os.path.isfile(path):
+        return np.asarray(np.load(path, mmap_mode="r"))
+    packed = os.path.join(cache_dir, f"{split}.npz")
+    with np.load(packed) as arrays:
+        return np.asarray(arrays[name]) if name in arrays.files else None
+
+
+def align_cache_field_to_output(cache_dir, split, values, output_run, output_event):
+    """Align a cache-order event field to token-budget loader output order.
+
+    Even with shuffle disabled, TokenBudgetBatchSampler sorts events by token
+    length to control padding.  Physics arrays collected from model batches are
+    therefore not in cache row order.  Stable (run,event) identity prevents a
+    silent subgroup-mask permutation.
+    """
+    cache_run = load_optional_split_array(cache_dir, split, "run")
+    cache_event = load_optional_split_array(cache_dir, split, "event")
+    if cache_run is None or cache_event is None:
+        raise ValueError("cache lacks run/event identity needed for field alignment")
+    cache_key = (cache_run.astype(np.uint64) << np.uint64(32)) | cache_event.astype(np.uint64)
+    output_key = (output_run.astype(np.uint64) << np.uint64(32)) | output_event.astype(np.uint64)
+    if len(np.unique(cache_key)) != len(cache_key):
+        raise ValueError("cache run/event identities are not unique")
+    order = np.argsort(cache_key)
+    sorted_key = cache_key[order]
+    position = np.searchsorted(sorted_key, output_key)
+    if np.any(position == len(sorted_key)) or not np.array_equal(
+            sorted_key[position], output_key):
+        raise ValueError("model output contains run/event identity absent from cache")
+    return np.asarray(values)[order[position]]
+
+
+def training_output_status(checkpoint):
+    """Mark which inference heads actually received a training objective."""
+    raw = checkpoint.get("config", {})
+    heads = raw.get("heads", {})
+    loss = raw.get("loss", {})
+    weighting = loss.get(
+        "weighting", "uncertainty" if loss.get("uncertainty_weighting", True)
+        else "fixed")
+    weights = loss.get("weights", {}) if weighting == "normalized" else {}
+    status = {}
+    for name in ("angle", "energy", "recon", "concept"):
+        enabled = True if name == "concept" else heads.get(name, {}).get("enabled", False)
+        weight = float(weights.get(name, 1.0))
+        status[name] = {
+            "head_enabled": bool(enabled),
+            "trained_with_nonzero_loss": bool(enabled and weight != 0.0),
+            "configured_weight": weight if weighting == "normalized" else None,
+        }
+    return {"seed": raw.get("seed"), "loss_weighting": weighting, "outputs": status}
 
 
 @torch.no_grad()
-def run_model(model, loader, device, amp_dtype):
-    ep, et, cp, ct, rerr = [], [], [], [], []
+def run_model(model, loader, device):
+    fields = {name: [] for name in
+              ("pred", "truth", "fit", "energy", "run", "event",
+               "concept_pred", "concept_true", "recon_mse", "energy_pred",
+               "centroid")}
+    model.eval()
     for batch in loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            out = model(batch)
-        ep.append(model.predict_energy_gev(out["energy"].float()).cpu().numpy())
-        et.append(batch["energy"].cpu().numpy())
-        cp.append(out["concepts"].float().cpu().numpy())
-        ct.append(batch["concepts"].cpu().numpy())
-        v = batch["valid"]
-        e = ((out["recon"].float() - batch["recon"]) ** 2 * v).sum(1) / v.sum(1).clamp_min(1)
-        rerr.append(e.cpu().numpy())
-    return (np.concatenate(ep), np.concatenate(et), np.concatenate(cp),
-            np.concatenate(ct), np.concatenate(rerr))
+        run = batch["run"].numpy()
+        event = batch["event"].numpy()
+        gpu = {k: (v if k in ("run", "event") else v.to(device))
+               for k, v in batch.items()}
+        out = model(gpu)  # fp32 on purpose
+        fields["pred"].append(model.predict_angle_slopes(out["angle"].float()).cpu().numpy())
+        fields["truth"].append(gpu["angle"].cpu().numpy())
+        fields["fit"].append(gpu["fit_angle"].cpu().numpy())
+        if "angle_baseline" in out:
+            fields["centroid"].append(out["angle_baseline"].float().cpu().numpy())
+        fields["energy"].append(gpu["energy"].cpu().numpy())
+        fields["run"].append(run)
+        fields["event"].append(event)
+        fields["concept_pred"].append(out["concepts"].float().cpu().numpy())
+        fields["concept_true"].append(gpu["concepts"].cpu().numpy())
+        valid = gpu["valid"]
+        mse = ((out["recon"].float() - gpu["recon"]) ** 2 * valid).sum(1)
+        mse = mse / valid.sum(1).clamp_min(1)
+        fields["recon_mse"].append(mse.cpu().numpy())
+        fields["energy_pred"].append(
+            model.predict_energy_gev(out["energy"].float()).cpu().numpy())
+    return {name: np.concatenate(parts) for name, parts in fields.items() if parts}
 
 
-def binned(e_true, r, bins):
-    """Per-bin metrics. v3 PRIMARY = Gaussian core (iterative mu+/-2sigma fit) + fitted
-    mean; robust core (IQR/1.349) is the cross-check; raw std + mean bias diagnostics."""
-    out = {k: [] for k in ("center", "res_gauss", "bias_gauss", "gauss_ok",
-                           "res", "bias", "res_raw", "bias_raw", "count")}
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        m = (e_true >= lo) & (e_true < hi)
-        if m.sum() < 20:
+def binned(values, model_err, fit_err, bins, angle_scale=1e3, angle_unit="mrad"):
+    result = {name: [] for name in
+              ("center", "low", "high", "count",
+               f"model_median_{angle_unit}", f"model_p68_{angle_unit}",
+               f"model_p90_{angle_unit}", f"fit_median_{angle_unit}",
+               f"fit_p68_{angle_unit}", f"fit_p90_{angle_unit}")}
+    for low, high in zip(bins[:-1], bins[1:]):
+        mask = (values >= low) & (values < high)
+        if int(mask.sum()) < 20:
             continue
-        rb = r[m]
-        g = gauss_core(rb)
-        out["center"].append(0.5 * (lo + hi))
-        out["res_gauss"].append(float(g["sigma"]))   # Gaussian core (v3 PRIMARY)
-        out["bias_gauss"].append(float(g["mu"]))     # fitted Gaussian mean
-        out["gauss_ok"].append(int(g["ok"]))
-        out["res"].append(robust_sigma(rb))          # robust core (cross-check)
-        out["bias"].append(float(np.median(rb)))     # median bias (robust)
-        out["res_raw"].append(float(np.std(rb)))     # raw std (diagnostic)
-        out["bias_raw"].append(float(np.mean(rb)))   # mean bias (diagnostic)
-        out["count"].append(int(m.sum()))
-    return {k: np.array(v) for k, v in out.items()}
+        model = containment_summary(model_err[mask])
+        fit = containment_summary(fit_err[mask])
+        result["center"].append(0.5 * (low + high))
+        result["low"].append(low)
+        result["high"].append(high)
+        result["count"].append(int(mask.sum()))
+        for prefix, summary in (("model", model), ("fit", fit)):
+            for metric in ("median", "p68", "p90"):
+                result[f"{prefix}_{metric}_{angle_unit}"].append(
+                    angle_scale * summary[metric])
+    return result
+
+
+def component_metrics(pred, truth):
+    residual = pred - truth
+    out = {}
+    for index, name in enumerate(("kx", "ky")):
+        r = residual[:, index]
+        out[name] = {
+            "bias": float(np.mean(r)),
+            "median_bias": float(np.median(r)),
+            "rmse": float(np.sqrt(np.mean(r ** 2))),
+            "std": float(np.std(r)),
+            "robust_sigma": robust_sigma(r),
+        }
+    return out
+
+
+def energy_summary(residual):
+    """Energy-resolution estimators matching the promoted energy report."""
+    residual = np.asarray(residual, dtype=np.float64)
+    residual = residual[np.isfinite(residual)]
+    gaussian = gauss_core(residual)
+    return {
+        "count": int(len(residual)),
+        "gaussian_core_percent": 100.0 * float(gaussian["sigma"]),
+        "gaussian_bias_percent": 100.0 * float(gaussian["mu"]),
+        "gaussian_fit_ok": bool(gaussian["ok"]),
+        "robust_core_percent": 100.0 * robust_sigma(residual),
+        "median_bias_percent": 100.0 * float(np.median(residual)),
+        "raw_std_percent": 100.0 * float(np.std(residual)),
+        "mean_bias_percent": 100.0 * float(np.mean(residual)),
+        "outlier_fraction_gt20pct": float(np.mean(np.abs(residual) > 0.20)),
+    }
+
+
+def energy_binned(energy, residual, bins):
+    out = {name: [] for name in (
+        "center", "low", "high", "count", "gaussian_core_percent",
+        "gaussian_bias_percent", "robust_core_percent", "raw_std_percent",
+        "outlier_fraction_gt20pct")}
+    for low, high in zip(bins[:-1], bins[1:]):
+        mask = (energy >= low) & (energy < high) & np.isfinite(residual)
+        if int(mask.sum()) < 20:
+            continue
+        summary = energy_summary(residual[mask])
+        out["center"].append(float(0.5 * (low + high)))
+        out["low"].append(float(low))
+        out["high"].append(float(high))
+        for name in out:
+            if name not in ("center", "low", "high"):
+                out[name].append(summary[name])
+    return out
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config/base.yaml")
-    ap.add_argument("--set", nargs="*", default=[], dest="overrides")
-    ap.add_argument("--ckpt", default=None)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config/base.yaml")
+    parser.add_argument("--set", nargs="*", default=[], dest="overrides")
+    parser.add_argument("--ckpt", default=None)
+    args = parser.parse_args()
     cfg, _ = load_config(args.config, args.overrides)
     device = cfg.device
-    meta = load_meta(cfg.paths.cache_dir)
-    ckpt_path = args.ckpt or os.path.join(cfg.paths.out_dir, "best.pt")
+    cache_meta = load_meta(cfg.paths.cache_dir)
+    checkpoint_path = args.ckpt or os.path.join(cfg.paths.out_dir, "best.pt")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Inference normalization belongs to the trained model, not the population
+    # on which it is being tested.  This matters for an uncut cache whose energy,
+    # angle, and concept distributions differ substantially from the training
+    # selection.  The legacy same-cache evaluation is unchanged because the two
+    # metadata dictionaries are then identical.
+    meta = checkpoint.get("meta", cache_meta)
+    if list(meta["concept_names"]) != list(cache_meta["concept_names"]):
+        raise ValueError("checkpoint and evaluation cache concept schemas differ")
+    if meta["geometry_data_type"] != cache_meta["geometry_data_type"]:
+        raise ValueError("checkpoint and evaluation cache geometries differ")
 
     concept_use = cfg.data.get("concept_use", None)
     n_concepts = len(concept_use) if concept_use else meta["n_concepts"]
     model = EcalTransformer(cfg, n_concepts).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
-    model.eval()
+    model.set_energy_norm(meta["log_energy_mean"], meta["log_energy_std"])
+    model.set_angle_norm(meta["angle_mean"], meta["angle_std"])
+    model.load_state_dict(checkpoint["model"])
 
-    test_ds = EcalTokens(cfg.paths.cache_dir, "test", meta, concept_use=concept_use)
-    loader = make_loader(test_ds, cfg, shuffle=False)
-    e_pred, e_true, c_pred, c_true, rerr = run_model(model, loader, device, amp_dtype_of(cfg))
-    r = (e_pred - e_true) / np.clip(e_true, 1e-3, None)
+    dataset = EcalTokens(
+        cfg.paths.cache_dir, "test", meta, concept_use=concept_use,
+        threshold_mev=cfg.data.get("runtime_threshold_mev", None),
+        compute_fit_resid=False)
+    arrays = run_model(model, make_loader(dataset, cfg, shuffle=False), device)
+    pred, truth, fit = arrays["pred"], arrays["truth"], arrays["fit"]
+    if not np.isfinite(pred).all():
+        raise RuntimeError(f"non-finite predictions: {(~np.isfinite(pred)).sum()}")
+    model_err = angular_error_np(pred, truth)
+    fit_err = angular_error_np(fit, truth)
+    model_summary = containment_summary(model_err)
+    fit_summary = containment_summary(fit_err)
 
-    bins = np.array(cfg.eval.energy_bins, dtype=float)
-    b = binned(e_true, r, bins)
+    unit_truth = slopes_to_unit_np(truth)
+    incidence_deg = np.degrees(np.arccos(np.clip(-unit_truth[:, 2], -1.0, 1.0)))
+    angle_unit = str(cfg.eval.get("angle_unit", "degree")).lower()
+    if angle_unit in ("degree", "degrees", "deg"):
+        angle_unit, angle_scale = "deg", 180.0 / np.pi
+    elif angle_unit == "mrad":
+        angle_scale = 1e3
+    else:
+        raise ValueError("eval.angle_unit must be degree/deg or mrad")
+    energy_bins = np.asarray(cfg.eval.energy_bins, dtype=float)
+    incidence_bins = np.asarray(cfg.eval.incidence_bins_deg, dtype=float)
+    by_energy = binned(
+        arrays["energy"], model_err, fit_err, energy_bins, angle_scale, angle_unit)
+    by_incidence = binned(
+        incidence_deg, model_err, fit_err, incidence_bins, angle_scale, angle_unit)
 
-    # per-concept resolution (de-standardise to raw 3D-fit units; subset-aware)
-    cstd = np.asarray(test_ds.cstd); cmean = np.asarray(test_ds.cmean)
-    cp_raw = c_pred * cstd + cmean
-    ct_raw = c_true * cstd + cmean
-    concept_metrics = {}
-    for j, name in enumerate(test_ds.concept_names):
-        var = np.var(ct_raw[:, j]) + 1e-9
-        r2 = 1.0 - np.mean((cp_raw[:, j] - ct_raw[:, j]) ** 2) / var
-        concept_metrics[name] = {"rmse": float(np.sqrt(np.mean((cp_raw[:, j]-ct_raw[:, j])**2))),
-                                 "r2": float(r2)}
+    cmean = np.asarray(dataset.cmean)
+    cstd = np.asarray(dataset.cstd)
+    cp = arrays["concept_pred"] * cstd + cmean
+    ct = arrays["concept_true"] * cstd + cmean
+    concepts = {}
+    for index, name in enumerate(dataset.concept_names):
+        valid_concept = np.isfinite(cp[:, index]) & np.isfinite(ct[:, index])
+        pred_col, true_col = cp[valid_concept, index], ct[valid_concept, index]
+        mse = np.mean((pred_col - true_col) ** 2)
+        variance = np.var(true_col) + 1e-12
+        concepts[name] = {
+            "count": int(valid_concept.sum()),
+            "rmse": float(np.sqrt(mse)),
+            "r2": float(1.0 - mse / variance),
+        }
 
-    # Reliable-range summary: the ECAL can't measure electrons past ~2 TeV (rear
-    # leakage), so report sigma/E restricted to <= e_cut alongside the full range.
-    roll = cfg.loss.get("energy_rolloff", None)
-    e_cut = float(roll.get("e_cut", 2000.0)) if roll is not None else 2000.0
-    m2 = e_true <= e_cut
-    le2 = b["center"] <= e_cut
-    g_all = gauss_core(r)
-    g_cut = gauss_core(r[m2]) if m2.any() else None
+    energy_residual = ((arrays["energy_pred"] - arrays["energy"]) /
+                       np.clip(arrays["energy"], 1e-3, None))
+    energy_e_cut = float(cfg.eval.get("energy_select_e_cut_gev", 2000.0))
+    energy_select = ((arrays["energy"] <= energy_e_cut)
+                     & np.isfinite(energy_residual))
+    selected_energy_residual = energy_residual[energy_select]
+    energy_metrics = energy_summary(selected_energy_residual)
+    energy_metrics["selection_max_gev"] = energy_e_cut
+    energy_metrics["all_energy"] = energy_summary(energy_residual)
+    energy_metrics["by_energy_gev"] = energy_binned(
+        arrays["energy"], energy_residual, energy_bins)
+
+    # The memmap all-event cache stores the two fields that defined the old
+    # training selection.  Report both deployment-population performance and
+    # the familiar contained/single-shower domain in the same output.
+    fit_status = load_optional_split_array(
+        cfg.paths.cache_dir, "test", "fit_status")
+    n_shower = load_optional_split_array(
+        cfg.paths.cache_dir, "test", "n_shower")
+    group_metrics = {}
+    if fit_status is not None and n_shower is not None:
+        if len(fit_status) != len(model_err) or len(n_shower) != len(model_err):
+            raise ValueError("quality-field length does not match evaluation events")
+        fit_status = align_cache_field_to_output(
+            cfg.paths.cache_dir, "test", fit_status, arrays["run"], arrays["event"])
+        n_shower = align_cache_field_to_output(
+            cfg.paths.cache_dir, "test", n_shower, arrays["run"], arrays["event"])
+        contained = (fit_status.astype(np.int64) & 7) == 7
+        single = n_shower.astype(np.int64) == 1
+        groups = {
+            "all_uncut": np.ones(len(model_err), dtype=bool),
+            "old_selection_contained_single": contained & single,
+            "outside_old_selection": ~(contained & single),
+            "contained_any_nshower": contained,
+            "single_shower_any_status": single,
+        }
+        centroid_err = (angular_error_np(arrays["centroid"], truth)
+                        if "centroid" in arrays else None)
+        for group_name, mask in groups.items():
+            model_group = containment_summary(model_err[mask])
+            finite_fit = mask & np.isfinite(fit_err)
+            fit_group = (containment_summary(fit_err[finite_fit])
+                         if int(finite_fit.sum()) else None)
+            energy_group = mask & energy_select
+            entry = {
+                "count": int(mask.sum()),
+                "fraction": float(mask.mean()),
+                "model": {
+                    (key if key == "count" else key + "_" + angle_unit):
+                    (value if key == "count" else angle_scale * value)
+                    for key, value in model_group.items()
+                },
+                "fit3d_finite_fraction": float(finite_fit.sum() / max(mask.sum(), 1)),
+                "energy_reconstruction": energy_summary(energy_residual[energy_group]),
+                "recon_logmse_mean": float(np.mean(arrays["recon_mse"][mask])),
+            }
+            if fit_group is not None:
+                entry["fit3d"] = {
+                    (key if key == "count" else key + "_" + angle_unit):
+                    (value if key == "count" else angle_scale * value)
+                    for key, value in fit_group.items()
+                }
+            if centroid_err is not None:
+                centroid_group = containment_summary(centroid_err[mask])
+                entry["centroid_baseline"] = {
+                    (key if key == "count" else key + "_" + angle_unit):
+                    (value if key == "count" else angle_scale * value)
+                    for key, value in centroid_group.items()
+                }
+            group_metrics[group_name] = entry
+
     metrics = {
-        "n_test": int(len(e_true)),
-        "sigma_estimator": "gauss_core_iter2sigma",
-        # PRIMARY metrics (v3): Gaussian core sigma + fitted-mean bias -- the SAME
-        # estimator train.py selects checkpoints on, so eval and selection agree.
-        "overall_res_gauss": float(g_all["sigma"]), "overall_bias_gauss": float(g_all["mu"]),
-        "gauss_ok": int(g_all["ok"]),
-        "bias_aware_metric_gauss": float(np.hypot(g_all["sigma"], g_all["mu"])),
-        "binwise_mean_res_gauss": float(np.mean(b["res_gauss"])) if len(b["res_gauss"]) else None,
-        "overall_res_gauss_le_cut": float(g_cut["sigma"]) if g_cut else None,
-        "binwise_mean_res_gauss_le_cut": (float(np.mean(b["res_gauss"][le2]))
-                                          if le2.any() else None),
-        # CROSS-CHECK: robust core (IQR/1.349) + median bias (the v2 primary).
-        "overall_res": robust_sigma(r), "overall_bias": float(np.median(r)),
-        "bias_aware_metric": float(np.sqrt(robust_sigma(r) ** 2 + np.median(r) ** 2)),
-        "binwise_mean_res": float(np.mean(b["res"])) if len(b["res"]) else None,
-        "overall_res_le_cut": robust_sigma(r[m2]) if m2.any() else None,
-        "binwise_mean_res_le_cut": float(np.mean(b["res"][le2])) if le2.any() else None,
-        # DIAGNOSTICS: raw std + mean bias (tail-sensitive legacy definition) and the
-        # outlier fraction that quantifies the non-Gaussian tail separately.
-        "overall_res_raw_std": float(np.std(r)), "overall_bias_mean": float(np.mean(r)),
-        "binwise_mean_res_raw_std": float(np.mean(b["res_raw"])) if len(b["res_raw"]) else None,
-        "overall_res_le_cut_raw_std": float(np.std(r[m2])) if m2.any() else None,
-        "outlier_frac": float(np.mean(np.abs(r) > 0.20)),
-        "e_cut_gev": e_cut,
-        "recon_logmse": float(np.mean(rerr)),
-        "bins": {k: v.tolist() for k, v in b.items()},
-        "concepts": concept_metrics,
+        "checkpoint": checkpoint_path,
+        "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
+        "checkpoint_training": training_output_status(checkpoint),
+        "evaluation_cache": cfg.paths.cache_dir,
+        "evaluation_cache_selection": cache_meta.get("selection"),
+        "normalization_source": "checkpoint_training_meta",
+        "n_test": int(len(model_err)),
+        "direction_representation": "slopes_dx_dz_dy_dz",
+        "inference_precision": "fp32",
+        "angle_unit": angle_unit,
+        "model": {(key if key == "count" else key + "_" + angle_unit):
+                  (value if key == "count" else angle_scale * value)
+                  for key, value in model_summary.items()},
+        "fit3d": {(key if key == "count" else key + "_" + angle_unit):
+                  (value if key == "count" else angle_scale * value)
+                  for key, value in fit_summary.items()},
+        "improvement_p68_percent": float(
+            100.0 * (fit_summary["p68"] - model_summary["p68"]) / fit_summary["p68"]),
+        "outlier_fraction_gt1p1459deg": float(np.mean(model_err > 0.020)),
+        "fit3d_outlier_fraction_gt1p1459deg": float(np.mean(fit_err > 0.020)),
+        "components": component_metrics(pred, truth),
+        "fit3d_components": component_metrics(fit, truth),
+        "by_energy_gev": by_energy,
+        "by_incidence_deg": by_incidence,
+        "aux_energy_residual_std": float(np.std(energy_residual)),
+        "aux_energy_bias": float(np.mean(energy_residual)),
+        "energy_reconstruction": energy_metrics,
+        "aux_recon_logmse": float(np.mean(arrays["recon_mse"])),
+        "concepts": concepts,
     }
-    with open(os.path.join(cfg.paths.out_dir, "metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(json.dumps({k: metrics[k] for k in
-          ["overall_res_gauss", "overall_bias_gauss", "overall_res_gauss_le_cut",
-           "binwise_mean_res_gauss", "overall_res", "overall_res_le_cut",
-           "overall_res_raw_std", "outlier_frac", "recon_logmse"]}, indent=2))
-    print("(overall_res_gauss = Gaussian core, iterative +/-2sigma fit; "
-          "overall_res = robust core IQR/1.349; overall_res_raw_std = legacy std)")
-    print("concept R^2:", {k: round(v["r2"], 3) for k, v in concept_metrics.items()})
+    if group_metrics:
+        metrics["event_groups"] = group_metrics
+    if "centroid" in arrays:
+        centroid_summary = containment_summary(angular_error_np(
+            arrays["centroid"], truth))
+        metrics["centroid_baseline"] = {
+            (key if key == "count" else key + "_" + angle_unit):
+            (value if key == "count" else angle_scale * value)
+            for key, value in centroid_summary.items()
+        }
+    os.makedirs(cfg.paths.out_dir, exist_ok=True)
+    with open(os.path.join(cfg.paths.out_dir, "metrics.json"), "w") as handle:
+        json.dump(metrics, handle, indent=2)
 
-    od = cfg.paths.out_dir
+    print(json.dumps({
+        "n_test": metrics["n_test"],
+        f"model_median_{angle_unit}": metrics["model"][f"median_{angle_unit}"],
+        f"model_p68_{angle_unit}": metrics["model"][f"p68_{angle_unit}"],
+        f"model_p90_{angle_unit}": metrics["model"][f"p90_{angle_unit}"],
+        f"fit3d_p68_{angle_unit}": metrics["fit3d"][f"p68_{angle_unit}"],
+        "improvement_p68_percent": metrics["improvement_p68_percent"],
+        "outlier_fraction_gt1p1459deg": metrics["outlier_fraction_gt1p1459deg"],
+        "energy_gaussian_core_percent": metrics["energy_reconstruction"][
+            "gaussian_core_percent"],
+        "energy_gaussian_bias_percent": metrics["energy_reconstruction"][
+            "gaussian_bias_percent"],
+    }, indent=2))
+
+    out_dir = cfg.paths.out_dir
     plt.figure()
-    plt.plot(b["center"], b["res_gauss"] * 100, "o-", label="Gaussian core (+/-2$\\sigma$ fit)")
-    plt.plot(b["center"], b["res"] * 100, "d-", alpha=.6, label="robust core (IQR/1.349)")
-    plt.plot(b["center"], b["res_raw"] * 100, "s--", alpha=.45, label="raw std")
-    plt.legend(); plt.xscale("log"); plt.xlabel("E_true [GeV]"); plt.ylabel("sigma/E [%]")
-    plt.title("Energy resolution"); plt.grid(True, alpha=.3)
-    plt.savefig(os.path.join(od, "resolution_vs_E.png"), dpi=130, bbox_inches="tight"); plt.close()
-
-    plt.figure(); plt.axhline(0, color="k", lw=.8)
-    plt.plot(b["center"], b["bias_gauss"] * 100, "o-", label="Gaussian-fit mean")
-    plt.plot(b["center"], b["bias"] * 100, "s-", alpha=.6, label="median bias")
-    plt.plot(b["center"], b["bias_raw"] * 100, "^--", alpha=.45, label="mean bias")
-    plt.legend(); plt.xscale("log"); plt.xlabel("E_true [GeV]"); plt.ylabel("bias [%]")
-    plt.title("Energy bias"); plt.grid(True, alpha=.3)
-    plt.savefig(os.path.join(od, "bias_vs_E.png"), dpi=130, bbox_inches="tight"); plt.close()
-
-    plt.figure(); plt.scatter(e_true, e_pred, s=3, alpha=.2)
-    lim = [max(e_true.min(), 1e-1), e_true.max()]
-    plt.plot(lim, lim, "r--"); plt.xscale("log"); plt.yscale("log")
-    plt.xlabel("E_true [GeV]"); plt.ylabel("E_pred [GeV]"); plt.title("DNN energy")
-    plt.savefig(os.path.join(od, "scatter.png"), dpi=130, bbox_inches="tight"); plt.close()
+    plt.plot(by_energy["center"], by_energy[f"model_p68_{angle_unit}"], "o-", label="Transformer")
+    plt.plot(by_energy["center"], by_energy[f"fit_p68_{angle_unit}"], "s--", label="3D fit")
+    plt.xscale("log"); plt.xlabel("MC energy [GeV]"); plt.ylabel(f"68% angle [{angle_unit}]")
+    plt.grid(True, alpha=.3); plt.legend(); plt.title("Direction resolution vs energy")
+    plt.savefig(os.path.join(out_dir, "angle_resolution_vs_energy.png"),
+                dpi=140, bbox_inches="tight"); plt.close()
 
     plt.figure()
-    plt.hist(r, bins=120, range=(-0.3, 0.3), density=False)
-    # overlay the fitted Gaussian core so the fit quality is visible
-    xs = np.linspace(-0.3, 0.3, 400)
-    n_in = np.sum((r > -0.3) & (r < 0.3))
-    scale = n_in * (0.6 / 120)
-    plt.plot(xs, scale / (np.sqrt(2*np.pi) * g_all["sigma"])
-             * np.exp(-0.5 * ((xs - g_all["mu"]) / g_all["sigma"]) ** 2),
-             "r-", lw=1.2, label="Gaussian core fit")
-    plt.legend()
-    plt.xlabel("(E_pred - E_true)/E_true"); plt.title(
-        f"gauss core={g_all['sigma']*100:.2f}% (mu={g_all['mu']*100:+.2f}%)  "
-        f"robust={robust_sigma(r)*100:.2f}%  raw-std={np.std(r)*100:.2f}%")
-    plt.savefig(os.path.join(od, "residual_hist.png"), dpi=130, bbox_inches="tight"); plt.close()
-    print("wrote metrics.json + 4 plots ->", od)
+    plt.plot(by_incidence["center"], by_incidence[f"model_p68_{angle_unit}"], "o-", label="Transformer")
+    plt.plot(by_incidence["center"], by_incidence[f"fit_p68_{angle_unit}"], "s--", label="3D fit")
+    plt.xlabel("Incidence angle from -z [deg]"); plt.ylabel(f"68% angle [{angle_unit}]")
+    plt.grid(True, alpha=.3); plt.legend(); plt.title("Direction resolution vs incidence")
+    plt.savefig(os.path.join(out_dir, "angle_resolution_vs_incidence.png"),
+                dpi=140, bbox_inches="tight"); plt.close()
+
+    finite_fit_err = fit_err[np.isfinite(fit_err)]
+    upper = max(np.quantile(model_err, .995),
+                np.quantile(finite_fit_err, .995)) * angle_scale
+    plt.figure()
+    plt.hist(model_err * angle_scale, bins=120, range=(0, upper), histtype="step", label="Transformer")
+    plt.hist(finite_fit_err * angle_scale, bins=120, range=(0, upper),
+             histtype="step", label="3D fit")
+    plt.xlabel(f"Opening-angle error [{angle_unit}]"); plt.ylabel("Events"); plt.legend()
+    plt.title("MC direction residual")
+    plt.savefig(os.path.join(out_dir, "angular_error_hist.png"),
+                dpi=140, bbox_inches="tight"); plt.close()
+
+    residual = pred - truth
+    plt.figure()
+    plt.hist(residual[:, 0], bins=120, range=(-.05, .05), histtype="step", label="kx")
+    plt.hist(residual[:, 1], bins=120, range=(-.05, .05), histtype="step", label="ky")
+    plt.xlabel("Predicted - true slope"); plt.ylabel("Events"); plt.legend()
+    plt.title("Slope-component residuals")
+    plt.savefig(os.path.join(out_dir, "slope_residuals.png"),
+                dpi=140, bbox_inches="tight"); plt.close()
+    print("wrote metrics.json + 4 plots ->", out_dir)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,60 @@
+#!/bin/bash
+# Generic production runner for an angleTransformer configuration override set.
+# Submit as: sbatch --job-name=<name> job_angle_variant.sub <name> key=value ...
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=64G
+#SBATCH --time=1-00:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+
+cd "$SLURM_SUBMIT_DIR" || exit 1
+# The site environment script is not strict-mode clean, so source it first (as
+# the established production jobs do) and enable strict handling afterwards.
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1 || exit 2
+set -euo pipefail
+python -c "import torch; assert torch.cuda.is_available(); print(torch.__version__,torch.cuda.get_device_name(0))"
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+set -o pipefail
+
+VARIANT=${1:?missing variant name}
+shift
+OVERRIDES=("$@")
+CFG=config/base.yaml
+C=/aifs/user/data/lishanglin/chenhao/angleTransformer/cache_full10
+O="runs/$VARIANT"
+mkdir -p "$O"
+
+echo "ANGLE_VARIANT_START name=$VARIANT host=$(hostname) time=$(date '+%F %T')"
+printf 'ANGLE_VARIANT_OVERRIDE %s\n' "${OVERRIDES[@]}"
+python -m unittest discover -s tests -v
+
+# Job 129152 owns the one-time full-cache build.  Waiting jobs only read it once
+# meta.json (written last by preprocess.py) and all three split files are complete.
+ready=0
+for ((attempt=0; attempt<240; ++attempt)); do
+  if [[ -s "$C/meta.json" && -s "$C/train.npz" && -s "$C/val.npz" && -s "$C/test.npz" ]]; then
+    ready=1
+    break
+  fi
+  if (( attempt % 5 == 0 )); then
+    echo "ANGLE_CACHE_WAIT attempt=$attempt time=$(date '+%F %T')"
+  fi
+  sleep 30
+done
+(( ready == 1 )) || { echo "ANGLE_CACHE_TIMEOUT"; exit 6; }
+echo "ANGLE_CACHE_READY time=$(date '+%F %T')"
+
+COMMON=("paths.cache_dir=$C" "paths.out_dir=$O"
+        "train.num_workers=$SLURM_CPUS_PER_TASK" "${OVERRIDES[@]}")
+if python train.py --config "$CFG" --set "${COMMON[@]}" 2>&1 | tee "$O/train.log"; then
+  python evaluate.py --config "$CFG" --set "${COMMON[@]}" 2>&1 | tee "$O/evaluate.log"
+  python probe.py --config "$CFG" --set "${COMMON[@]}" 2>&1 | tee "$O/probe.log"
+  python export_predictions.py --config "$CFG" --set "${COMMON[@]}" 2>&1 | tee "$O/export.log"
+  echo "ANGLE_VARIANT_OK name=$VARIANT time=$(date '+%F %T')"
+else
+  echo "ANGLE_VARIANT_FAILED name=$VARIANT time=$(date '+%F %T')"
+  exit 3
+fi

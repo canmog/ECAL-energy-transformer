@@ -1,46 +1,147 @@
-# transformer_v3 — Gaussian-core selection & evaluation
+# angleTransformer
 
-Fork of `transformer_v2cham` (the champion: wdx + v2m1 fit-quality weighting on the
-`sw_d192` model). The trained objective is UNCHANGED; v3 changes the **resolution
-estimator** and adds the capacity re-check and two analysis tools.
+Reconstruct the MC incidence direction from AMS-02 ECAL cells with the same
+geometry, sparse-token Transformer, strict selection, and optimization settings
+as `ecalTransformer`.
 
-## What's new vs v2cham
+This workspace is a backup device. Do not run Git/GitHub commands here. Edit the
+local tree, let Mutagen synchronize it to
+`lsl:/aifs/user/data/lishanglin/chenhao`, and execute data/GPU work on `lsl`.
 
-* `utils/stats.py::gauss_core` — the calorimetry-standard **Gaussian core sigma**:
-  binned Gaussian fit restricted to `mu +/- 2 sigma`, iterated until the fitted sigma
-  is stable (seeded from median + IQR/1.349; corrected-truncated-moments fallback,
-  then robust fallback — never crashes on a weird epoch-0 distribution).
-* `train.py` — validation logs `val_res_gauss` / `val_bias_gauss`; the selection
-  metric supports `core: gauss`, `bias: gauss` (the v3 default); multi-best now also
-  saves `best_gauss.pt` (min Gaussian core alone) next to best/best_robust/best_raw.
-* `evaluate.py` — Gaussian core (overall / <=2 TeV / per-bin) is the PRIMARY metric
-  (`overall_res_gauss`, `sigma_estimator: gauss_core_iter2sigma`); robust core stays
-  as the cross-check; raw std + outlier fraction stay as tail diagnostics. The
-  residual histogram now overlays the fitted Gaussian core.
-* `rescore_gauss.py` — re-scores every saved v2-lineage checkpoint + the 3D-fit
-  anchor (`cache_m2:anchor` = kx_EneL2Cor) with all three estimators on the SAME
-  cache_full10 test split; writes `runs/rescore/rescore_gauss.{json,md}`.
-* `outlier_study.py` — profiles the |dE/E|>20% (and >100%) events of a chosen
-  checkpoint against per-event physics variables (E, tokens, deposited energy,
-  max-cell fraction, fit residual, first/last layer, the 11 concepts, |slope|,
-  edge distance); writes `runs/outliers/outliers.md` + rate plots + worst-100 CSV.
+## Direction convention
 
-## Jobs
+The network regresses two slopes rather than `(theta,phi)`:
 
-| job | what |
-|---|---|
-| `job_rescore.sub`  | rescore all checkpoints + champion outlier profile (no training) |
-| `job_v3_d192.sub`  | champion objective + gauss selection, d192 (A/B vs v2cham: selection estimator only) |
-| `job_v3_d256.sub`  | capacity re-check, d256, lr 2e-4 |
-| `job_v3_d320.sub`  | capacity re-check, d320, lr 1.5e-4 |
+```text
+mcKX = dx/dz = tan(mcTheta) cos(mcPhi)
+mcKY = dy/dz = tan(mcTheta) sin(mcPhi)
+```
 
-Estimator definitions: gauss = iterative +/-2 sigma binned fit; robust = IQR/1.349;
-raw = np.std. Outlier = fraction |dE/E| > 20%. All selection restricted to E <= 2 TeV.
+For these downward-going events the incoming unit vector is
+`(-mcKX,-mcKY,-1)/sqrt(1+mcKX^2+mcKY^2)`. This representation has no `phi=+/-pi`
+discontinuity. X reflection flips `mcKX`; Y reflection flips `mcKY`.
 
-## Evaluation precision (found 2026-07-02)
+## Augmenting datasets/full
 
-bf16 inference adds a median 0.38% per-event energy perturbation, inflating the
-Gaussian core by 5-13% relative (measured A/B: 1.12 -> 1.26% at 1-2 TeV). Training
-stays bf16, but EVALUATION is fp32: the v3 job files pass `train.amp_dtype=fp32` to
-evaluate.py, and `rescore_gauss.py --fp32` re-scores historical checkpoints without
-the penalty. Historical (v1/v2) numbers are bf16-evaluated.
+`root/addMcAngleBatch.C` clones every existing branch into a same-directory
+temporary ROOT file, adds these truth branches, verifies the result, and only then
+atomically replaces the original pathname:
+
+```text
+mcTheta mcPhi mcDirX mcDirY mcDirZ mcKX mcKY
+```
+
+The updater matches MC and 3D-fit events on `(run,event)`, not entry position.
+`root/verifyFullAngles.C` is an independent, entry-by-entry verifier against both
+source files.
+
+Dry-run one file without modifying it:
+
+```bash
+ssh lsl
+cd /aifs/user/data/lishanglin/chenhao/angleTransformer
+root -l -b -q 'root/addMcAngleBatch.C("/aifs/user/data/lishanglin/datasets/full/eBep0_254000.list_0000.emini08-full.root","/aifs/user/data/lishanglin/datasets/mcinfo/eBep0_254000.list_0000.emini08.root",false)'
+```
+
+Update and independently verify all 50 files:
+
+```bash
+bash root/update_full_angles.sh
+bash root/verify_all_full_angles.sh
+```
+
+The scripts are idempotent: fully updated files are verified and skipped.
+
+## Model and metrics
+
+The primary output is standardized `(mcKX,mcKY)` from a learned-query attention
+pool. Energy, expected-cell reconstruction, and the 11 concept targets remain
+auxiliary tasks. The angle truth is never down-weighted by 3D-fit quality.
+
+Checkpoint selection uses the validation 68% containment opening angle. Evaluation
+is fp32 and reports median/p68/p90/p95 in degrees versus energy and incidence angle,
+alongside the `kx_ShwrKX/KY` 3D-fit baseline on exactly the same events.
+
+## Run on lsl
+
+```bash
+cd /aifs/user/data/lishanglin/chenhao/angleTransformer
+bash smoke_test.sh
+
+# Full cache + interactive training/evaluation
+bash run.sh
+
+# Or production training (builds the full cache when needed)
+sbatch job_angle_d192.sub
+```
+
+`export_predictions.py` writes run/event IDs, slopes, unit vectors, theta/phi,
+truth, and the 3D-fit baseline to `predictions_<split>.npz`.
+
+The three concurrent direction-improvement variants, their physical motivation,
+and current job IDs are recorded in `EXPERIMENTS.md`.  Submit the same controlled
+set with `bash submit_angle_experiments.sh` when no copies are already queued.
+
+## Post-J1 jobs: learned fit and joint reconstruction
+
+Two full-data jobs extend the fixed-10-MeV J1 result without changing or removing
+any Transformer outputs. Both use the J1 d192/six-block architecture, seed 73111,
+no reflection, a 100-epoch maximum, minimum epoch 40 before early stopping, and
+patience 25. Submit them together with:
+
+```bash
+bash submit_angle_joint2.sh
+```
+
+`angle_residual_robustfit_d192_t10` changes only J1's analytic starting axis. It
+first performs the original `E_layer^1.5` centroid fit, predicts a bounded
+per-layer reliability multiplier from ECAL-only layer energy, width, occupancy,
+maximum-cell fraction, depth, and first-fit residual, and refits the two views.
+The reliability output is initialized to one, so training starts exactly at the
+fixed J1 fit. The residual head, normalization, loss, schedule, and zero auxiliary
+weights remain J1.
+
+Submitted as SLURM job `823429` (`an5_robust`).
+
+`angle_energy_multitask_d192_t10` keeps the fixed J1 centroid and trains one shared
+Transformer on all four established tasks: MC angle, MC energy, expected-cell
+reconstruction, and all 11 concepts. It uses EMA-normalized Kendall--Gal weighting
+with log-variance decay 0.01. Fit-quality weights apply only to reconstruction and
+concept losses; MC energy and MC angle are never fit-quality weighted. It saves
+separate best-angle and best-energy validation checkpoints, and evaluates energy
+with the fp32 Gaussian-core estimator used by the promoted energy model.
+
+Submitted as SLURM job `823430` (`an5_joint`).
+
+At inference both jobs remain ECAL-only. MC truth, expected deposits, concepts, and
+3D-fit slopes are targets or references, never input tokens.
+
+### Completed result and repeated-seed replicas (2026-08-16)
+
+Job `823429` completed all 100 epochs. Its learned two-pass coarse fit improved
+the fixed-centroid p68 from `2.4777 deg` to `2.2127 deg`, but its final angle p68
+was `0.2776 deg`, slightly worse than J1's `0.2769 deg`; this branch is not
+promoted.
+
+Job `823430` also completed all 100 epochs. Its best-angle checkpoint (epoch 99)
+has angle p68/p90/p95 of `0.2770/0.5709/0.7606 deg`, RMS `0.3843 deg`, and
+`1.332%` of events above `1.1459 deg`. Thus p68 matches J1 while angular tails
+improve. Its energy Gaussian-core resolution is `1.0965%` below 2 TeV and
+`1.1100%` over all energies; raw energy tails remain slightly worse than the
+energy-only champion.
+
+Two exact joint-model replicas were submitted with:
+
+```bash
+bash submit_angle_joint_seeds.sh
+```
+
+- job `974909` (`an5_js123`): seed 123,
+  `runs/angle_energy_multitask_d192_t10_s123`;
+- job `974910` (`an5_js777`): seed 777,
+  `runs/angle_energy_multitask_d192_t10_s777`.
+
+Both use the same data split, fixed 10 MeV threshold, architecture, four losses,
+optimizer, 100-epoch maximum, epoch-40 early-stopping floor, patience 25, and
+best-angle/best-energy evaluation as job `823430`. Only seed, job name, and output
+directory differ.

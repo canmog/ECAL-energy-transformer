@@ -1,4 +1,4 @@
-"""ROOT -> tokenised cache (sparse hits) + concept/energy targets + meta.json.
+"""ROOT -> tokenised cache with energy, direction, recon, and concept targets.
 
     python -m data.preprocess --config config/base.yaml
 
@@ -10,6 +10,9 @@ Each split stores a CSR-style ragged token layout:
     tok_ehit       f32   [T]     measured cell energy (stored ~MeV)  -> INPUT
     tok_expe       f32   [T]     3D-fit expected cell energy (~MeV)  -> recon TARGET
     energy         f32   [N]     mcEne (GeV)                          -> energy TARGET
+    angle          f32   [N,2]   MC (dx/dz,dy/dz)                    -> angle TARGET
+    fit_angle      f32   [N,2]   3D-fit slopes                       -> baseline only
+    run,event      u32   [N]     stable event identity
     concepts       f32   [N, C]  raw 3D-fit concept values            -> bottleneck TARGET
 Geometry is NOT baked in here — the dataset derives it from data.geometry so a
 single edit there re-propagates everywhere.
@@ -71,7 +74,7 @@ def _shape_concepts(src, table):
     inv = 1.0 / np.clip(w.sum(axis=(1, 2)), 1e-9, None)       # (n,)
     depth = table["depth"][None]                              # (1,18,72) layer idx
     t_cm = table["t_cm"][None]                                # (1,18,72) cm
-    view = table["view"]                                      # (18,72) 0=X 1=Y
+    view = table["view"]                                      # (18,72) stored view 0/1
 
     tmax = (w * depth).sum(axis=(1, 2)) * inv                 # (n,)
     long_var = (w * (depth - tmax[:, None, None]) ** 2).sum(axis=(1, 2)) * inv
@@ -105,7 +108,9 @@ def main():
     rng = np.random.default_rng(cfg.seed)
 
     read = [d.ehit_branch, d.expehit_branch, d.target_branch,
-            d.stat_branch, d.nshwr_branch, d.ref_branch]
+            d.stat_branch, d.nshwr_branch, d.ref_branch,
+            d.run_branch, d.event_branch]
+    read += list(d.angle_branches) + list(d.fit_angle_branches)
     read += [c.branch for c in d.concepts if not c.get("derive")]
     read = sorted(set(read))
 
@@ -116,7 +121,7 @@ def main():
     print(f"reading {len(paths)} input file(s)")
 
     tok_layer, tok_cell, tok_ehit, tok_expe = [], [], [], []
-    counts, energy, concepts = [], [], []
+    counts, energy, angles, fit_angles, concepts, runs, events = [], [], [], [], [], [], []
     n_seen = 0
     stop = None if d.max_events in (None, "null") else int(d.max_events)
 
@@ -127,11 +132,19 @@ def main():
         ehit = _as_3d(chunk[d.ehit_branch])
         expe = _as_3d(chunk[d.expehit_branch])
         mc = np.asarray(chunk[d.target_branch]).astype(np.float32)
+        angle = np.stack([np.asarray(chunk[b]).ravel() for b in d.angle_branches],
+                         axis=1).astype(np.float32)
+        fit_angle = np.stack([_scalar(chunk[b], 0).ravel()
+                              for b in d.fit_angle_branches], axis=1).astype(np.float32)
+        run = np.asarray(chunk[d.run_branch]).ravel().astype(np.uint32)
+        event = np.asarray(chunk[d.event_branch]).ravel().astype(np.uint32)
         n = ehit.shape[0]
 
         keep = np.ones(n, dtype=bool)
         if sel.require_truth:
             keep &= mc > 0
+        if sel.get("require_angle_truth", True):
+            keep &= np.isfinite(angle).all(axis=1)
         if sel.select_contained:
             stat0 = _scalar(chunk[d.stat_branch], 0).astype(np.int64)
             keep &= (stat0 & 7) == 7
@@ -146,6 +159,8 @@ def main():
             n_seen += n
             continue
         ehit, expe, mc = ehit[idx], expe[idx], mc[idx]
+        angle, fit_angle = angle[idx], fit_angle[idx]
+        run, event = run[idx], event[idx]
 
         # concept matrix for kept events. Branch concepts read straight from the
         # ROOT chunk; derived shape concepts are energy-weighted moments of the
@@ -169,7 +184,11 @@ def main():
         tok_expe.append(expe[ev, la, ce].astype(np.float32))
         counts.append(np.bincount(ev, minlength=ehit.shape[0]).astype(np.int64))
         energy.append(mc)
+        angles.append(angle)
+        fit_angles.append(fit_angle)
         concepts.append(cmat)
+        runs.append(run)
+        events.append(event)
         n_seen += n
         print(f"  processed {n_seen} events, kept {sum(len(e) for e in energy)}", end="\r")
 
@@ -180,7 +199,11 @@ def main():
     tok_expe = np.concatenate(tok_expe)
     counts = np.concatenate(counts)
     energy = np.concatenate(energy)
+    angles = np.concatenate(angles, axis=0)
+    fit_angles = np.concatenate(fit_angles, axis=0)
     concepts = np.concatenate(concepts, axis=0)
+    runs = np.concatenate(runs)
+    events = np.concatenate(events)
     N = energy.shape[0]
     print(f"kept {N} events, {tok_layer.shape[0]} tokens "
           f"(mean {tok_layer.shape[0]/max(N,1):.1f}/event)")
@@ -194,7 +217,11 @@ def main():
         dropped = int((~nonempty).sum())
         counts = counts[nonempty]
         energy = energy[nonempty]
+        angles = angles[nonempty]
+        fit_angles = fit_angles[nonempty]
         concepts = concepts[nonempty]
+        runs = runs[nonempty]
+        events = events[nonempty]
         N = energy.shape[0]
         print(f"dropped {dropped} zero-token events -> {N} remain")
 
@@ -220,7 +247,12 @@ def main():
         cat = lambda xs: np.concatenate(xs) if xs else np.zeros(0)
         return dict(off=offs, tok_layer=cat(li).astype(np.int16), tok_cell=cat(ci).astype(np.int16),
                     tok_ehit=cat(eh).astype(np.float32), tok_expe=cat(ex).astype(np.float32),
-                    energy=energy[order].astype(np.float32), concepts=concepts[order].astype(np.float32))
+                    energy=energy[order].astype(np.float32),
+                    angle=angles[order].astype(np.float32),
+                    fit_angle=fit_angles[order].astype(np.float32),
+                    concepts=concepts[order].astype(np.float32),
+                    run=runs[order].astype(np.uint32),
+                    event=events[order].astype(np.uint32))
 
     packs = {k: gather(v) for k, v in splits.items()}
     for k, p in packs.items():
@@ -232,6 +264,8 @@ def main():
     loge = np.log(np.clip(tr["energy"], 1e-3, None))
     cmean = tr["concepts"].mean(axis=0)
     cstd = tr["concepts"].std(axis=0) + 1e-6
+    amean = tr["angle"].mean(axis=0)
+    astd = tr["angle"].std(axis=0) + 1e-6
     meta = {
         "n_concepts": len(concept_names),
         "concept_names": concept_names,
@@ -242,6 +276,11 @@ def main():
         "concept_std": cstd.tolist(),
         "log_energy_mean": float(loge.mean()),
         "log_energy_std": float(loge.std() + 1e-6),
+        "angle_names": list(d.angle_names),
+        "angle_mean": amean.tolist(),
+        "angle_std": astd.tolist(),
+        "angle_reflect_x": [-1, 1],
+        "angle_reflect_y": [1, -1],
         "threshold_mev": float(d.threshold_mev),
         "cell_scale": float(d.cell_scale),
         "geometry_data_type": cfg.geometry.data_type,
@@ -250,7 +289,8 @@ def main():
     with open(os.path.join(cfg.paths.cache_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print("wrote meta.json:", {k: meta[k] for k in
-          ["n_concepts", "log_energy_mean", "log_energy_std", "threshold_mev"]})
+          ["n_concepts", "log_energy_mean", "log_energy_std", "angle_mean",
+           "angle_std", "threshold_mev"]})
 
 
 if __name__ == "__main__":

@@ -1,0 +1,57 @@
+#!/bin/bash
+# Evaluate seed-73111 checkpoints on the held-out split of the uncut cache.
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=64G
+#SBATCH --time=08:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+
+cd "$SLURM_SUBMIT_DIR" || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1 || exit 2
+set -euo pipefail
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+C=/aifs/user/data/lishanglin/chenhao/angleTransformer/cache_all10_uncut
+ROOT=runs/eval_all10_uncut_seed73111
+python -c "import torch; assert torch.cuda.is_available(); print(torch.__version__,torch.cuda.get_device_name(0))"
+python -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m.get("complete"); assert m["retained_events"] + m["dropped_by_selection_or_zero_tokens"] == m["raw_events_seen"]; assert not any(m["selection"].values()); assert m["threshold_mev"] == 10.0; print(json.dumps(m["split_sizes"],indent=2))' "$C/meta.json"
+python -m unittest discover -s tests -v
+mkdir -p "$ROOT"
+
+evaluate_one() {
+  local label=$1
+  local model_dir=$2
+  local checkpoint=$3
+  local output="$ROOT/$label"
+  mkdir -p "$output"
+  echo "ALL10_EVAL_START label=$label checkpoint=$checkpoint time=$(date '+%F %T')"
+  python evaluate.py --config "$model_dir/config.json" --ckpt "$checkpoint" \
+    --set "paths.cache_dir=$C" "paths.out_dir=$output" \
+    train.num_workers=0 data.runtime_threshold_mev=10.0 \
+    2>&1 | tee "$output/evaluate.log"
+  echo "ALL10_EVAL_OK label=$label time=$(date '+%F %T')"
+}
+
+# J1 is the requested seed-73111 full baseline.  Only its angle objective had a
+# non-zero weight; its other head numbers are retained as explicitly marked
+# negative controls, not physics reconstruction results.
+evaluate_one \
+  j1_best_angle \
+  runs/angle_residual_full_d192_t10 \
+  runs/angle_residual_full_d192_t10/best.pt
+
+# The seed-73111 joint model is the valid source of energy/reconstruction/concept
+# results.  Evaluate both validation-selected operating points.
+evaluate_one \
+  joint_best_angle \
+  runs/angle_energy_multitask_d192_t10 \
+  runs/angle_energy_multitask_d192_t10/best_angle.pt
+evaluate_one \
+  joint_best_energy \
+  runs/angle_energy_multitask_d192_t10 \
+  runs/angle_energy_multitask_d192_t10/best_energy.pt
+
+echo "ALL10_SEED73111_OK output=$ROOT time=$(date '+%F %T')"

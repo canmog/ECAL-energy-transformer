@@ -13,6 +13,3 @@ __pycache__/
 # editor / tooling
 *.swp
 .claude/
-
-# provenance stamp (written by .git/hooks/post-commit; changes every commit)
-GIT_VERSION

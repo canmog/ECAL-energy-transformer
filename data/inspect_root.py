@@ -1,80 +1,96 @@
-"""Run FIRST on the node. Verify branches, shapes, units before trusting anything.
-
-    python -m data.inspect_root --config config/base.yaml
-"""
+"""Validate the augmented full ROOT schema, direction convention, shapes, and units."""
 import argparse
+import glob
 import sys
 
 import numpy as np
 import uproot
 
 sys.path.insert(0, ".")
-from utils.config import load_config  # noqa: E402
+from data.geometry import N_CELL, N_LAYER
+from utils.angle import angular_error_np
+from utils.config import load_config
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config/base.yaml")
-    ap.add_argument("--set", nargs="*", default=[], dest="overrides")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config/base.yaml")
+    parser.add_argument("--set", nargs="*", default=[], dest="overrides")
+    args = parser.parse_args()
     cfg, _ = load_config(args.config, args.overrides)
-
-    import glob as globmod
-    paths = sorted(globmod.glob(cfg.paths.root_file))
+    d = cfg.data
+    paths = sorted(glob.glob(cfg.paths.root_file))
     if not paths:
         raise FileNotFoundError(f"no ROOT files match {cfg.paths.root_file!r}")
-    print(f"{len(paths)} file(s) match; inspecting the first: {paths[0]}")
-    f = uproot.open(paths[0])
-    tree = f[cfg.paths.tree]
-    print(f"tree={cfg.paths.tree}  n_entries={tree.num_entries} (first file only)")
 
-    needed = [cfg.data.ehit_branch, cfg.data.expehit_branch, cfg.data.target_branch,
-              cfg.data.stat_branch, cfg.data.nshwr_branch, cfg.data.ref_branch]
-    needed += [c.branch for c in cfg.data.concepts if c.get("branch")]
-    have = set(tree.keys())
-    print("\n-- branch presence --")
-    for b in needed:
-        print(f"  {'OK ' if b in have else 'MISSING'}  {b}")
+    needed = [d.ehit_branch, d.expehit_branch, d.target_branch,
+              d.stat_branch, d.nshwr_branch, d.ref_branch,
+              d.run_branch, d.event_branch,
+              *list(d.angle_branches), *list(d.fit_angle_branches),
+              "mcTheta", "mcPhi", "mcDirX", "mcDirY", "mcDirZ"]
+    needed += [c.branch for c in d.concepts if c.get("branch")]
+    needed = sorted(set(needed))
 
+    total = 0
+    for path in paths:
+        tree = uproot.open(f"{path}:{cfg.paths.tree}")
+        missing = sorted(set(needed) - set(tree.keys()))
+        if missing:
+            raise RuntimeError(f"{path}: missing branches {missing}")
+        total += tree.num_entries
+    print(f"schema OK in {len(paths)} files; total entries={total}")
+
+    path = paths[0]
+    tree = uproot.open(f"{path}:{cfg.paths.tree}")
     n = min(5000, tree.num_entries)
-    arrs = tree.arrays([cfg.data.ehit_branch, cfg.data.expehit_branch,
-                        cfg.data.target_branch], entry_stop=n, library="np")
-    ehit = arrs[cfg.data.ehit_branch]
-    expe = arrs[cfg.data.expehit_branch]
-    mc = arrs[cfg.data.target_branch]
+    read = [d.ehit_branch, d.expehit_branch, d.target_branch,
+            *list(d.angle_branches), *list(d.fit_angle_branches),
+            d.stat_branch, d.nshwr_branch,
+            "mcTheta", "mcPhi", "mcDirX", "mcDirY", "mcDirZ"]
+    arrays = tree.arrays(read, entry_stop=n, library="np")
 
-    e0 = np.asarray(ehit[0])
-    print(f"\n-- shapes (event 0) --\n  {cfg.data.ehit_branch}: {e0.shape} (expect (18,72) or flat 1296)")
+    ehit = np.asarray(arrays[d.ehit_branch], dtype=np.float32).reshape(n, N_LAYER, N_CELL)
+    expe = np.asarray(arrays[d.expehit_branch], dtype=np.float32).reshape(n, N_LAYER, N_CELL)
+    energy = np.asarray(arrays[d.target_branch]).ravel()
+    angle = np.stack([np.asarray(arrays[b]).ravel() for b in d.angle_branches], axis=1)
+    fit = np.stack([np.asarray(arrays[b])[:, 0] for b in d.fit_angle_branches], axis=1)
+    stat0 = np.asarray(arrays[d.stat_branch])[:, 0].astype(np.int64)
+    nshower = np.asarray(arrays[d.nshwr_branch]).ravel().astype(np.int64)
+    theta = np.asarray(arrays["mcTheta"]).ravel()
+    phi = np.asarray(arrays["mcPhi"]).ravel()
+    direction = np.stack([np.asarray(arrays[b]).ravel()
+                          for b in ("mcDirX", "mcDirY", "mcDirZ")], axis=1)
 
-    # Physics check of the axis order: averaged over events, the energy fraction per
-    # *layer* (axis 0) must show a longitudinal EM shower profile — rising to a peak
-    # at mid-depth then falling. If axis 0 were the cell axis, the profile would be
-    # a broad lateral bump centred near index 36 instead, with no rise-fall over 18.
-    grids = np.stack([np.asarray(a, dtype=np.float64).reshape(18, 72) for a in ehit[:1000]])
-    prof = grids.sum(axis=2).mean(axis=0)
-    prof = prof / max(prof.sum(), 1e-9)
-    peak = int(np.argmax(prof))
-    print("\n-- longitudinal profile check (axis 0 = layer?) --")
-    print("  mean energy fraction per layer:", " ".join(f"{p:.3f}" for p in prof))
-    print(f"  peak at layer {peak} (expect a smooth rise-then-fall; the peak deepens "
-          f"with energy — ~4-8 at tens of GeV, ~9-13 for a TeV-weighted spectrum. "
-          f"Flat or edge-peaked would mean the axis order is wrong)")
+    expected_direction = np.stack([
+        np.sin(theta) * np.cos(phi),
+        np.sin(theta) * np.sin(phi),
+        np.cos(theta)], axis=1)
+    expected_slopes = expected_direction[:, :2] / expected_direction[:, 2:3]
+    if not np.allclose(direction, expected_direction, rtol=0, atol=5e-6):
+        raise RuntimeError("mcDirX/Y/Z do not match mcTheta/mcPhi")
+    if not np.allclose(angle, expected_slopes, rtol=0, atol=5e-6):
+        raise RuntimeError("mcKX/KY do not match mcTheta/mcPhi")
+    norms = np.linalg.norm(direction, axis=1)
 
-    ehit_flat = np.concatenate([np.asarray(a).ravel() for a in ehit])
-    expe_flat = np.concatenate([np.asarray(a).ravel() for a in expe])
-    nz = ehit_flat[ehit_flat > 0]
-    print("\n-- kx_ehit (stored, ~MeV) --")
-    print(f"  nonzero cells: min={nz.min():.4g} max={nz.max():.4g} median={np.median(nz):.4g}")
-    print(f"  cells > 0.1 MeV per event (mean): {(ehit_flat > 0.1).sum() / n:.1f}")
-    print(f"  cells > 5.0 MeV per event (mean): {(ehit_flat > 5.0).sum() / n:.1f}")
-    print(f"  -> /{cfg.data.cell_scale:.0f} = GeV; sum/event mean = "
-          f"{ehit_flat.sum() / n / cfg.data.cell_scale:.3f} GeV")
-    print("\n-- kx_expehit (recon target) --")
-    nze = expe_flat[expe_flat > 0]
-    print(f"  nonzero: min={nze.min():.4g} max={nze.max():.4g}  frac>0 = {(expe_flat>0).mean():.3f}")
-    print("\n-- mcEne (GeV) --")
-    print(f"  min={mc.min():.3g} max={mc.max():.3g} mean={mc.mean():.3g}  frac<=0 = {(mc<=0).mean():.3f}")
-    print("\nIf shapes/units look right, run: python -m data.preprocess --config", args.config)
+    profile = ehit[:1000].sum(axis=2).mean(axis=0)
+    profile /= max(profile.sum(), 1e-12)
+    nonzero = ehit[ehit > 0]
+    selected = (energy > 0) & ((stat0 & 7) == 7) & (nshower == 1)
+    fit_error = angular_error_np(fit[selected], angle[selected])
+    finite_fit = fit_error[np.isfinite(fit_error)]
+    print(f"first file: {path}")
+    print(f"  entries={tree.num_entries} branches={len(tree.keys())}")
+    print(f"  cell shape={ehit.shape[1:]} expected={(N_LAYER, N_CELL)}")
+    print(f"  longitudinal peak layer={int(np.argmax(profile))}")
+    print(f"  ehit nonzero min/median/max={nonzero.min():.5g}/"
+          f"{np.median(nonzero):.5g}/{nonzero.max():.5g} stored MeV")
+    print(f"  expe finite={np.isfinite(expe).all()} energy range={energy.min():.4g}..{energy.max():.4g} GeV")
+    print(f"  direction norm max|norm-1|={np.max(np.abs(norms-1)):.3g}")
+    print(f"  mcKX range={angle[:,0].min():.4f}..{angle[:,0].max():.4f} "
+          f"mcKY range={angle[:,1].min():.4f}..{angle[:,1].max():.4f}")
+    print(f"  selected sample={int(selected.sum())}/{n} "
+          f"3D-fit p68={1e3*np.quantile(finite_fit, .68):.3f} mrad")
+    print("ROOT inspection passed")
 
 
 if __name__ == "__main__":

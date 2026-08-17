@@ -1,82 +1,47 @@
-# ============================================================================
-# transformer_v3/ — champion model + GAUSSIAN-CORE selection & evaluation
+# ECAL incidence-direction reconstruction.
 #
-# Same trained objective as transformer_v2cham (wdx + v2m1 fit-quality weighting on the
-# sw_d192 model); what changes is the RESOLUTION ESTIMATOR: the primary sigma/E is now
-# the Gaussian core from an iterative +/-2 sigma binned fit (utils/stats.gauss_core,
-# the calorimetry-standard ROOT-style estimator), used BOTH for checkpoint selection
-# (train.select_metric core=gauss, bias=gauss -> best.pt/early stop) AND as the primary
-# number in evaluate.py. IQR/1.349 stays as the cross-check; raw std / outlier fraction
-# stay as tail diagnostics. Multi-best now saves best.pt / best_gauss.pt /
-# best_robust.pt / best_raw.pt from one training.
-#
-# Also in v3: the capacity re-check (d256/d320 with lr scaled down; job_v3_d256/320.sub),
-# the checkpoint re-scorer (rescore_gauss.py) and the catastrophic-event profiler
-# (outlier_study.py).
-#
-# What "sw_d192 baseline" means, concretely (vs. the dual_v1 build it was forked
-# from): plain energy head, residual bypass ON, ALL 11 concepts, Kendall-Gal
-# (loss-normalised) homoscedastic weighting, NO energy rolloff, dropout 0.05,
-# 50 epochs.  The new-stack pieces (dual head, bypass-off, 2 TeV rolloff,
-# 7-concept trim) that REGRESSED resolution are deliberately OFF here.
-#
-# Build scope:  input  = kx_ehit (per-cell deposition)
-#               outputs = energy  +  kx_expehit (micro reconstruction)
-#               aux     = soft-bottleneck concept head (3D-fit params)
-# Everything marked "RESERVED" is a config/data hook, not implemented yet.
-# ============================================================================
+# This is the ecalTransformer d192 champion configuration with one new primary
+# task: MC-truth direction represented by the two slopes (dx/dz, dy/dz). Energy,
+# expected-cell reconstruction, and the 11 physics concepts stay enabled as
+# auxiliary tasks. Checkpoint selection is angle-specific (68% containment).
 
 seed: 42
 device: cuda
 
 paths:
-  # Merged 50-file dataset (CERN 3dfit + mcinfo pairs -> merge/merge_all.sh).
-  # root_file accepts a glob; single-file paths still work.
+  # These files are the existing tree3dfit + mcEne files after root/update_full_angles.sh
+  # appends mcTheta/mcPhi, mcDirX/Y/Z, and mcKX/KY without dropping old branches.
   root_file: /aifs/user/data/lishanglin/datasets/full/*-full.root
   tree: tree3dfit
-  # Reuse the STRICT cache that sw_d192 trained on (10 MeV cut, single-shower,
-  # contained, 11 concepts stored). Shared from the transformer/ dir so we don't
-  # re-preprocess 3.38M events. Override with --set paths.cache_dir=... to rebuild
-  # a private cache here.
-  cache_dir: /aifs/user/data/lishanglin/chenhao/transformer/cache_full10
-  out_dir:   /aifs/user/data/lishanglin/chenhao/ecalTransformer/runs/v3_d192
+  cache_dir: /aifs/user/data/lishanglin/chenhao/angleTransformer/cache_full10
+  out_dir: /aifs/user/data/lishanglin/chenhao/angleTransformer/runs/angle_d192
 
 data:
-  target_branch: mcEne          # MC truth energy (GeV)
-  ehit_branch: kx_ehit          # [18][72] measured cell energy, stored x1000 (~MeV)
-  expehit_branch: kx_expehit    # [18][72] 3D-fit EXPECTED cell energy (recon target)
-  cell_scale: 1000.0            # stored / cell_scale = GeV ; stored value ~= MeV
-  threshold_mev: 10.0           # tokenize cells with stored kx_ehit > this (MeV).
-                                # Raised 0.1 -> 10 (above the standard 5 MeV reco cut):
-                                # drops sub-MIP noise cells that dominate high-E showers
-                                # and feed the high-E instability.
-  max_events: null              # null = all
+  target_branch: mcEne
+  angle_branches: [mcKX, mcKY]
+  angle_names: [mc_kx, mc_ky]
+  run_branch: _run
+  event_branch: _event
+  fit_angle_branches: [kx_ShwrKX, kx_ShwrKY]
+  ehit_branch: kx_ehit
+  expehit_branch: kx_expehit
+  cell_scale: 1000.0
+  threshold_mev: 10.0
+  max_events: null
   val_fraction: 0.15
   test_fraction: 0.15
 
-  # ---- Event selection (sw_d192 baseline): contained + single-shower.
-  # Physics note: the ENERGY head is ill-posed on uncontained / multi-shower events
-  # (the ECAL never cleanly measured the energy).
   selection:
-    require_truth: true               # drop mcEne <= 0 (unmatched); harmless, keep on
-    select_contained: true            # (kx_ShwrStat[0] & 7) == 7
-    select_single_shower: true        # kx_N_Shwr == 1  (removes ~39% multi-shower events)
-    require_positive_ref: false       # kx_EleEne > 0
-    pid_electron_only: false          # RESERVED: gate on PID==e once PID exists
+    require_truth: true
+    require_angle_truth: true
+    select_contained: true
+    select_single_shower: true
+    require_positive_ref: false
+    pid_electron_only: false
   stat_branch: kx_ShwrStat
   nshwr_branch: kx_N_Shwr
   ref_branch: kx_EleEne
 
-  # Concept-set trim: which concepts the bottleneck predicts (load-time subset of the
-  # list below; NO cache rebuild). sw_d192 baseline uses ALL 11 concepts, so this is
-  # LEFT OFF (commented). Uncomment to drop the energy-irrelevant x0/y0/kx/ky.
-  # concept_use: [shwr_z0, shwr_a0, frac_lat, frac_rear, tmax, lat_width, long_width]
-
-  # ---- Soft-bottleneck concepts (primary shower [0]); ENERGY EXCLUDED on purpose.
-  # reflect_x / reflect_y = sign the concept picks up under an x / y mirror (aug).
-  # coord: x|y marks a GLOBAL coordinate along that axis: under its view's mirror
-  # it flips about the array centre (x -> 2*c̄_v - x), not about 0 — see
-  # geometry.mirror_centers(). Slopes/scalars: coord null (pure sign).
   concepts:
     - {name: shwr_x0,   branch: kx_ShwrX0,       index: 0,    reflect_x: -1, reflect_y:  1, coord: x}
     - {name: shwr_y0,   branch: kx_ShwrY0,       index: 0,    reflect_x:  1, reflect_y: -1, coord: y}
@@ -86,82 +51,62 @@ data:
     - {name: shwr_a0,   branch: kx_ShwrA0,       index: 0,    reflect_x:  1, reflect_y:  1, coord: null}
     - {name: frac_lat,  branch: kx_FracLatLeak,  index: null, reflect_x:  1, reflect_y:  1, coord: null}
     - {name: frac_rear, branch: kx_FracRearLeak, index: null, reflect_x:  1, reflect_y:  1, coord: null}
-    # Derived shower-shape concepts: energy-weighted moments of the 3D-fit EXPECTED
-    # cell map (kx_expehit), computed in preprocess -> no ROOT branch. All scalar
-    # shape quantities, invariant under x/y mirror (reflect = +1, coord null).
-    #   tmax       longitudinal shower-max depth  = <layer>_E            (~X0)
-    #   long_width longitudinal RMS (shower length)= sqrt(<(layer-tmax)^2>_E)
-    #   lat_width  transverse RMS spread          = sqrt(<(t-t_view)^2>_E) (cm)
     - {name: tmax,       derive: tmax,       source: expe, index: 0, reflect_x: 1, reflect_y: 1, coord: null}
     - {name: lat_width,  derive: lat_width,  source: expe, index: 0, reflect_x: 1, reflect_y: 1, coord: null}
     - {name: long_width, derive: long_width, source: expe, index: 0, reflect_x: 1, reflect_y: 1, coord: null}
 
 geometry:
-  data_type: MC                 # MC | ISS | TB  (alignment set; RESERVED switch)
+  data_type: MC
 
 model:
   d_model: 192
   n_blocks: 6
   n_heads: 8
   ffn_mult: 4
-  dropout: 0.05                 # sw_d192 baseline (best on small AND complete data)
-  tap_block: 3                  # soft bottleneck after this many encoder blocks
-  d_phys: 64                    # supervised sub-space (probe this)
-  d_free: 128                   # residual sub-space
-  pos_embed: true               # learned (layer,cell) positional embedding
-  bottleneck_residual: true     # sw_d192: KEEP the `tokens +` skip at the tap (bypass ON)
-  dual_energy_head: false       # sw_d192: PLAIN energy head (energy = single deep head)
+  dropout: 0.05
+  tap_block: 3
+  d_phys: 64
+  d_free: 128
+  pos_embed: true
+  bottleneck_residual: true
+  dual_energy_head: false
 
-# Task heads. energy + recon active; the rest are RESERVED registry slots.
 heads:
-  energy:   {enabled: true,  hidden: [128]}
-  recon:    {enabled: true,  hidden: [128]}   # micro-unit reconstruction of kx_expehit
-  angle:    {enabled: false}                  # RESERVED: incident 3-vector
-  position: {enabled: false}                  # RESERVED: ECAL entry (first-hit) point
-  pid:      {enabled: false}                  # RESERVED: e/p classification
+  energy:   {enabled: true, hidden: [128]}
+  recon:    {enabled: true, hidden: [128]}
+  angle:    {enabled: true, type: global, hidden: [128]}
+  position: {enabled: false}
+  pid:      {enabled: false}
 
 loss:
-  # sw_d192 baseline weighting: Kendall & Gal (2018) homoscedastic auto-balance,
-  # loss-normalised + log-var weight-decayed so the task weights stay bounded on
-  # large data (w_energy stayed ~1.3, vs the unbounded vanilla form that ran to 451).
   uncertainty_weighting: true
-  logvar_weight_decay: 0.01     # mild decay on the Kendall-Gal log-variances (0 = off)
-  # weighting: / weights:       LEFT OFF -> train.py defaults to "uncertainty"
-  #                             (Kendall-Gal) given uncertainty_weighting: true.
-  #                             The dual_v1 NormalizedWeighter (fixed aux 0.3) is NOT used.
-  # energy_rolloff:             LEFT OFF -> no high-E down-weighting (sw_d192 baseline).
-  #                             validate()/evaluate.py still report the E<=2 TeV summary
-  #                             (e_cut defaults to 2000 GeV when rolloff is absent).
+  logvar_weight_decay: 0.01
   energy:  {delta: 0.1}
+  angle:   {mode: huber, delta: 0.1, epsilon: 0.001}
   concept: {delta: 0.1}
   recon:   {delta: 0.1}
-  # CHAMPION: v2m1 fit-quality weighting (down-weight concept+recon on poorly-fit events).
+  # Only noisy 3D-fit supervision is down-weighted. MC energy and angle never are.
   fit_quality_weight: {enabled: true, apply_to: [concept, recon], beta: 1.0, w_min: 0.2}
 
 train:
-  epochs: 50                    # sw_d192 baseline run length
-  batch_size: 512               # hard cap on events per batch
-  max_tokens_per_batch: 65536   # PADDED-token budget per batch (the real memory knob:
-                                # selected showers average ~390 tokens, max ~1160)
-  optimizer: adamw              # validated; anything else raises
+  epochs: 50
+  batch_size: 512
+  max_tokens_per_batch: 65536
+  optimizer: adamw
   lr: 3.0e-4
-  weight_decay: 1.0e-2          # NOT applied to the Kendall-Gal log-variances
-  wd_exclude_1d: true           # CHAMPION: the wdx win (exclude 1-D params from weight decay).
-  # v3: composite checkpoint-selection metric now defaults to the GAUSSIAN CORE
-  # (iterative +/-2 sigma fit) + the fitted Gaussian mean as the bias. Set
-  # core=robust bias=median to reproduce the v2cham selection exactly.
-  #   core:      gauss | robust | raw_std
-  #   bias:      gauss | median | mean | none
-  #   tail_term: none | outlier | raw_std | excess   (excess = raw_std - robust)
-  #   metric = sqrt(core^2 + bias^2) + tail_weight * tail_term
-  select_metric: {core: gauss, bias: gauss, tail_term: none, tail_weight: 0.0}
+  weight_decay: 1.0e-2
+  wd_exclude_1d: true
   warmup_epochs: 5
   grad_clip: 5.0
-  amp_dtype: bf16               # bf16 | fp32/none (honored; fp16 raises)
-  compile: true                 # torch.compile (inductor); set false to debug
+  amp_dtype: bf16
+  compile: true
   num_workers: 6
   early_stop_patience: 20
-  augment: {reflect_x: true, reflect_y: true}   # NO 90deg: 5 X vs 4 Y superlayers
+  augment: {reflect_x: true, reflect_y: true}
 
 eval:
+  angle_unit: degree
+  energy_select_e_cut_gev: 2000.0
   energy_bins: [0, 10, 20, 50, 100, 150, 200, 300, 500, 1000, 2000, 4000]
+  # Incidence angle measured away from the downward (-z) axis, in degrees.
+  incidence_bins_deg: [0, 5, 10, 15, 20, 25, 30, 40]

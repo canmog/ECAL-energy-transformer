@@ -6,20 +6,22 @@ Detector facts that drive this module
 -------------------------------------
 * 648 x 648 x 166.5 mm active volume = 17 X0; 0.7 nuclear interaction lengths.
 * 9 superlayers, each 18.5 mm thick. Fibres in ONE superlayer all run the SAME
-  direction. The view therefore alternates at the *superlayer* level:
+  direction. The stored fibre-orientation view therefore alternates at the
+  *superlayer* level:
       superlayer = ilayer // 2          (two longitudinal readouts per superlayer)
       readout    = ilayer %  2          (which of the two depth samplings)
-      view       = superlayer % 2       (0 = X, 1 = Y)   <-- per SUPERLAYER, not per layer
-  -> X = superlayers {0,2,4,6,8} (5),  Y = superlayers {1,3,5,7} (4).  [confirmed]
+      view       = superlayer % 2       (0/1 fibre orientation)
+  -> view 0 = superlayers {0,2,4,6,8} (5), view 1 = {1,3,5,7} (4).
 * Readout granularity: 18 longitudinal samplings x 72 lateral cells. Each anode
   covers a 9 x 9 mm cell (pitch = 0.9 cm) and ~1 X0 in depth (depth_X0 ~ ilayer).
 * OffSetMC[9][2] is indexed [superlayer][readout=ilayer%2] (per-layer alignment,
   microns), NOT [superlayer][view]. CommonOffSetMC[2] is the per-view common shift.
 
 A single layer measures only ONE projection, so a cell (ilayer, icell) is a strip:
-known depth z and known transverse coordinate t along the view axis; the orthogonal
-coordinate is unmeasured. The Transformer fuses the two views via attention — which
-is exactly what the bottleneck axis-concepts (ShwrX0/Y0/Z0) then read out.
+known depth z and known transverse coordinate t orthogonal to its fibres.  The
+empirical full-cache convention audit found that stored view 0 measures the Y/ky
+projection and stored view 1 measures X/kx.  Keep this mapping in one place below;
+never infer a physical component directly from the integer view label.
 """
 import numpy as np
 
@@ -29,6 +31,12 @@ PITCH_CM = 0.9                     # 9 mm anode pitch  (648 mm / 72)  [confirmed
 UM2CM = 1.0e-4                     # geo.md
 ENEDEP_THRESHOLD_STD = 5.0         # geo.md standard reco threshold (MeV); we go lower
 
+# Physical direction-component mapping for the stored fibre-orientation label.
+# component_views[k] gives the stored view measuring component k, with k=0 -> kx
+# and k=1 -> ky.  The inverse is useful for symmetry probes.
+COMPONENT_VIEWS = (1, 0)
+COMPONENT_OF_VIEW = tuple(COMPONENT_VIEWS.index(v) for v in (0, 1))
+
 # Per-layer depth z (cm), from geo.md Ecal_Z[18] (the +/-0.005 already folded in).
 ECAL_Z = np.array([
     -143.220, -144.130, -145.070, -145.980, -146.920, -147.830,
@@ -36,7 +44,7 @@ ECAL_Z = np.array([
     -154.320, -155.230, -156.170, -157.080, -158.020, -158.930,
 ], dtype=np.float64)
 
-# Per-view common shift (cm); index = view (0=X, 1=Y).
+# Per stored fibre-orientation view common shift (cm); index = view 0/1.
 COMMON_OFFSET = {
     "MC":  np.array([-0.13,  0.075], dtype=np.float64),
     "TB":  np.array([-0.17,  0.085], dtype=np.float64),
@@ -78,7 +86,7 @@ def superlayer_of(ilayer):
 
 
 def view_of(ilayer):
-    """0 = X (superlayers 0,2,4,6,8), 1 = Y (superlayers 1,3,5,7)."""
+    """Stored fibre-orientation view (0/1), not the measured X/Y component."""
     return (ilayer // 2) % 2
 
 
@@ -88,7 +96,7 @@ def build_geometry_table(data_type="MC"):
     Returns a dict of [18, 72] arrays:
         t_cm   : transverse coordinate along the layer's view axis (cm)
         z_cm   : longitudinal depth (cm), constant per layer
-        view   : 0 (X) or 1 (Y), constant per layer
+        view   : stored fibre-orientation view 0/1, constant per layer
         depth  : X0 depth proxy ~ ilayer (0..17), constant per layer
     """
     common = COMMON_OFFSET[data_type]
@@ -123,7 +131,7 @@ _T_HALF = (N_CELL / 2.0) * PITCH_CM + 1.0                   # ~ 33 cm
 def token_geometry_features(ilayer, icell, table):
     """Build the per-token geometry feature block (used by the dataset).
 
-    Returns [t_norm, z_norm, depth_norm, view_x, view_y] for each token.
+    Returns [t_norm, z_norm, depth_norm, view_0, view_1] for each token.
     `ilayer`, `icell` are integer arrays of equal length; `table` from
     build_geometry_table().
     """
@@ -135,16 +143,16 @@ def token_geometry_features(ilayer, icell, table):
     t_norm = t / _T_HALF
     z_norm = (z - _Z_MID) / _Z_HALF
     depth_norm = dp / (N_LAYER - 1)
-    view_x = (vw == 0).astype(np.float32)
-    view_y = (vw == 1).astype(np.float32)
-    return np.stack([t_norm, z_norm, depth_norm, view_x, view_y], axis=-1).astype(np.float32)
+    view_0 = (vw == 0).astype(np.float32)
+    view_1 = (vw == 1).astype(np.float32)
+    return np.stack([t_norm, z_norm, depth_norm, view_0, view_1], axis=-1).astype(np.float32)
 
 
-GEOM_FEATURE_DIM = 5  # [t_norm, z_norm, depth_norm, view_x, view_y]
+GEOM_FEATURE_DIM = 5  # [t_norm, z_norm, depth_norm, view_0, view_1]
 
 
 def mirror_centers(table):
-    """Per-view mean transverse array centre c̄_v (cm), keyed by view (0=X, 1=Y).
+    """Per-view mean transverse array centre c̄_v (cm), keyed by stored view.
 
     A cell-index flip (icell -> 71-icell) mirrors each layer about its OWN array
     centre c_l = common + offset (the centred base grid is symmetric), not about
@@ -169,11 +177,10 @@ def t_norm_table(table):
 if __name__ == "__main__":
     # Quick eyeball check — run on the node: python -m data.geometry
     tab = build_geometry_table("MC")
-    print("view per layer (0=X,1=Y):", tab["view"][:, 0].tolist())
-    nx = int((tab["view"][:, 0] == 0).sum())
-    ny = int((tab["view"][:, 0] == 1).sum())
-    print(f"X layers={nx} (expect 10),  Y layers={ny} (expect 8)")
-    print("superlayers X:", sorted({il // 2 for il in range(N_LAYER) if view_of(il) == 0}))
-    print("superlayers Y:", sorted({il // 2 for il in range(N_LAYER) if view_of(il) == 1}))
+    print("stored view per layer:", tab["view"][:, 0].tolist())
+    n0 = int((tab["view"][:, 0] == 0).sum())
+    n1 = int((tab["view"][:, 0] == 1).sum())
+    print(f"view-0 layers={n0} (measure Y/ky), view-1 layers={n1} (measure X/kx)")
+    print("component_views [kx,ky]:", COMPONENT_VIEWS)
     print("t range (cm): [%.2f, %.2f]" % (tab["t_cm"].min(), tab["t_cm"].max()))
     print("z range (cm): [%.2f, %.2f]" % (tab["z_cm"].min(), tab["z_cm"].max()))

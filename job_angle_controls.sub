@@ -1,0 +1,53 @@
+#!/bin/bash
+# Cheap direction-pipeline control: train one 2x2 variant and evaluate it at the
+# same fixed 10 MeV threshold. Submit through submit_angle_controls.sh.
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=64G
+#SBATCH --time=0-12:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+
+cd "$SLURM_SUBMIT_DIR" || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1 || exit 2
+set -euo pipefail
+python -c "import torch; assert torch.cuda.is_available(); print(torch.__version__,torch.cuda.get_device_name(0))"
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+set -o pipefail
+
+VARIANT=${1:?missing variant name}
+shift
+OVERRIDES=("$@")
+CFG=config/base.yaml
+C=/aifs/user/data/lishanglin/chenhao/angleTransformer/cache_full10
+O="runs/$VARIANT"
+mkdir -p "$O"
+
+echo "ANGLE_CONTROL_START name=$VARIANT host=$(hostname) time=$(date '+%F %T')"
+printf 'ANGLE_CONTROL_OVERRIDE %s\n' "${OVERRIDES[@]}"
+python -m unittest discover -s tests -v
+
+[[ -s "$C/meta.json" && -s "$C/train.npz" && -s "$C/val.npz" && -s "$C/test.npz" ]] || {
+  echo "ANGLE_CONTROL_CACHE_MISSING path=$C"
+  exit 6
+}
+
+COMMON=("paths.cache_dir=$C" "paths.out_dir=$O"
+        "train.num_workers=$SLURM_CPUS_PER_TASK" "${OVERRIDES[@]}")
+python train.py --config "$CFG" --set "${COMMON[@]}" 2>&1 | tee "$O/train.log"
+
+for THRESHOLD in 10; do
+  E="$O/eval_t${THRESHOLD}"
+  mkdir -p "$E"
+  python evaluate.py --config "$CFG" --ckpt "$O/best.pt" \
+    --set "${COMMON[@]}" "paths.out_dir=$E" \
+    "data.runtime_threshold_mev=$THRESHOLD" 2>&1 | tee "$E/evaluate.log"
+  python evaluate_centroid.py --config "$CFG" --split test --device cuda \
+    --weight-power 1.5 --component-views 1,0 \
+    --set "${COMMON[@]}" "data.runtime_threshold_mev=$THRESHOLD" \
+    2>&1 | tee "$E/centroid.log"
+done
+
+echo "ANGLE_CONTROL_OK name=$VARIANT time=$(date '+%F %T')"

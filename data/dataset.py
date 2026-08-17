@@ -1,12 +1,12 @@
-"""Torch dataset over the tokenised cache + physics-correct reflection augmentation.
+"""Torch dataset over the token cache with direction-aware reflection augmentation.
 
 Token feature vector (per hit cell):
-    [ log1p(ehit_MeV), t_norm, z_norm, depth_norm, view_x, view_y ]   (dim = 6)
+    [ log1p(ehit_MeV), t_norm, z_norm, depth_norm, view_0, view_1 ]   (dim = 6)
 plus an integer (layer,cell) id for the learned positional embedding.
 
 Augmentation = x / y mirror only (NO 90deg: 5 X vs 4 Y superlayers). A mirror
 re-indexes the affected view's cells (icell -> 71-icell) and sign-flips the
-concept targets via their reflect_x / reflect_y signs (from meta.json).
+concept and MC-direction targets via their physical reflection rules.
 """
 import json
 import os
@@ -15,25 +15,57 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from data.geometry import (build_geometry_table, mirror_centers,
+from data.geometry import (COMPONENT_VIEWS, build_geometry_table, mirror_centers,
                            token_geometry_features, GEOM_FEATURE_DIM, N_CELL)
 
 TOKEN_FEATURE_DIM = 1 + GEOM_FEATURE_DIM   # log1p(E) + geometry block
 
 
+def _load_split(cache_dir, split):
+    """Open either the legacy single-NPZ split or a memory-mapped split.
+
+    The all-event cache is too large to materialise from one NPZ in every
+    DataLoader process.  Its arrays therefore live as ``<split>/<name>.npy``
+    files and are opened read-only with mmap.  Existing production caches keep
+    their original ``<split>.npz`` format.
+    """
+    split_dir = os.path.join(cache_dir, split)
+    if os.path.isdir(split_dir):
+        required = (
+            "off", "tok_layer", "tok_cell", "tok_ehit", "tok_expe",
+            "energy", "angle", "fit_angle", "run", "event", "concepts",
+        )
+        arrays = {}
+        for name in required:
+            path = os.path.join(split_dir, f"{name}.npy")
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"missing cache array {path}")
+            arrays[name] = np.load(path, mmap_mode="r")
+        return arrays
+    return np.load(os.path.join(cache_dir, f"{split}.npz"))
+
+
 class EcalTokens(Dataset):
     def __init__(self, cache_dir, split, meta, train=False, augment=None, concept_use=None,
-                 e_max=None):
+                 e_max=None, threshold_mev=None, threshold_jitter_mev=None,
+                 max_events=None, subset_seed=0, compute_fit_resid=True):
         self.train = train
         self.aug = augment or {}
-        z = np.load(os.path.join(cache_dir, f"{split}.npz"))
-        self.off = z["off"]
-        self.layer = z["tok_layer"].astype(np.int64)
-        self.cell = z["tok_cell"].astype(np.int64)
-        self.ehit = z["tok_ehit"].astype(np.float32)
-        self.expe = z["tok_expe"].astype(np.float32)
-        self.energy = z["energy"].astype(np.float32)
-        concepts = z["concepts"].astype(np.float32)
+        z = _load_split(cache_dir, split)
+        # Preserve on-disk dtypes.  In particular, expanding every int16 token
+        # index to int64 would add many GB for the all-event cache.  Per-event
+        # position IDs are converted to int64 only after slicing in __getitem__.
+        self.off = np.asarray(z["off"])
+        self.layer = np.asarray(z["tok_layer"])
+        self.cell = np.asarray(z["tok_cell"])
+        self.ehit = np.asarray(z["tok_ehit"])
+        self.expe = np.asarray(z["tok_expe"])
+        self.energy = np.asarray(z["energy"])
+        self.angle = np.asarray(z["angle"])
+        self.fit_angle = np.asarray(z["fit_angle"])
+        self.run = np.asarray(z["run"])
+        self.event = np.asarray(z["event"])
+        concepts = np.asarray(z["concepts"])
 
         # e_max (data.train_e_max): drop events above an energy cut AT LOAD TIME — the
         # held-out-TeV extrapolation test (train <=e_max, evaluate the full range).
@@ -46,23 +78,46 @@ class EcalTokens(Dataset):
             self.layer, self.cell = self.layer[tok_keep], self.cell[tok_keep]
             self.ehit, self.expe = self.ehit[tok_keep], self.expe[tok_keep]
             self.energy = self.energy[keep]
+            self.angle = self.angle[keep]
+            self.fit_angle = self.fit_angle[keep]
+            self.run = self.run[keep]
+            self.event = self.event[keep]
             concepts = concepts[keep]
             off = np.zeros(int(keep.sum()) + 1, dtype=np.int64)
             np.cumsum(counts[keep], out=off[1:])
             self.off = off
             print(f"[dataset:{split}] e_max={e_max} GeV: kept {int(keep.sum())}/{len(keep)} events")
 
+        # A deterministic logical event subset avoids copying the very large CSR
+        # token arrays.  It is used only by cheap pipeline-control runs.
+        self.indices = np.arange(len(self.energy), dtype=np.int64)
+        if max_events is not None and len(self.indices) > int(max_events):
+            rng = np.random.default_rng(int(subset_seed))
+            self.indices = np.sort(
+                rng.choice(self.indices, size=int(max_events), replace=False))
+            print(f"[dataset:{split}] subset: kept {len(self.indices)}/{len(self.energy)} events")
+
+        self.threshold_mev = (None if threshold_mev is None else float(threshold_mev))
+        self.threshold_jitter_mev = (None if threshold_jitter_mev is None else
+                                     tuple(float(v) for v in threshold_jitter_mev))
+        if self.threshold_jitter_mev is not None:
+            if len(self.threshold_jitter_mev) != 2:
+                raise ValueError("threshold_jitter_mev must be [low,high]")
+            low, high = self.threshold_jitter_mev
+            if low < 0 or high < low:
+                raise ValueError("invalid threshold_jitter_mev range")
+
         # v2m1: per-event 3D-fit goodness = token-level relative residual
         #   resid = sum|ehit - expe| / (sum ehit + eps)
         # computed once over the CSR layout (no cache rebuild). Used to DOWN-weight the
         # physics (concept/recon) supervision on poorly-fit events; it is energy-based
         # so mirror augmentation leaves it unchanged.
-        if len(self.off) > 1:
+        if compute_fit_resid and len(self.off) > 1:
             num = np.add.reduceat(np.abs(self.ehit - self.expe), self.off[:-1])
             den = np.add.reduceat(self.ehit, self.off[:-1])
             self.fit_resid = (num / np.clip(den, 1e-9, None)).astype(np.float32)
         else:
-            self.fit_resid = np.zeros(0, dtype=np.float32)
+            self.fit_resid = np.zeros(len(self.energy), dtype=np.float32)
 
         # Concept-set trim (load-time column subset; NO cache rebuild). concept_use is
         # an optional list of concept NAMES to keep (energy-irrelevant x0/y0/kx/ky are
@@ -75,11 +130,15 @@ class EcalTokens(Dataset):
         self.concepts = concepts[:, self.cidx]
 
         self.table = build_geometry_table(meta["geometry_data_type"])
-        self.view_of_layer = self.table["view"][:, 0]          # (18,) 0=X 1=Y
+        self.view_of_layer = self.table["view"][:, 0]          # stored view 0/1
         self.log_mean = meta["log_energy_mean"]
         self.log_std = meta["log_energy_std"]
         self.cmean = np.asarray(meta["concept_mean"], np.float32)[self.cidx]
         self.cstd = np.asarray(meta["concept_std"], np.float32)[self.cidx]
+        self.amean = np.asarray(meta["angle_mean"], np.float32)
+        self.astd = np.asarray(meta["angle_std"], np.float32)
+        self.arx = np.asarray(meta["angle_reflect_x"], np.float32)
+        self.ary = np.asarray(meta["angle_reflect_y"], np.float32)
         self.rx = np.asarray(meta["concept_reflect_x"], np.float32)[self.cidx]
         self.ry = np.asarray(meta["concept_reflect_y"], np.float32)[self.cidx]
         # Coordinate concepts flip about the per-view array centre, not 0: the
@@ -88,30 +147,53 @@ class EcalTokens(Dataset):
         cents = mirror_centers(self.table)
         coord = meta.get("concept_coord") or [None] * len(names)
         coord = [coord[j] for j in idx]
-        self.offx = np.array([2 * cents[0] if c == "x" else 0.0 for c in coord], np.float32)
-        self.offy = np.array([2 * cents[1] if c == "y" else 0.0 for c in coord], np.float32)
+        self.offx = np.array(
+            [2 * cents[COMPONENT_VIEWS[0]] if c == "x" else 0.0 for c in coord],
+            np.float32)
+        self.offy = np.array(
+            [2 * cents[COMPONENT_VIEWS[1]] if c == "y" else 0.0 for c in coord],
+            np.float32)
 
     def __len__(self):
-        return len(self.energy)
+        return len(self.indices)
 
     def __getitem__(self, i):
+        i = int(self.indices[i])
         s, t = self.off[i], self.off[i + 1]
         layer = self.layer[s:t].copy()
         cell = self.cell[s:t].copy()
         ehit = self.ehit[s:t]
         expe = self.expe[s:t]
         concept = self.concepts[i].copy()
+        angle = self.angle[i].copy()
+        fit_angle = self.fit_angle[i].copy()
+
+        threshold = self.threshold_mev
+        if self.train and self.threshold_jitter_mev is not None:
+            low, high = self.threshold_jitter_mev
+            threshold = np.random.uniform(low, high)
+        if threshold is not None:
+            keep = ehit > threshold
+            if not np.any(keep):
+                raise RuntimeError(
+                    f"event index {i} has no cells above runtime threshold {threshold:.3g} MeV")
+            layer, cell = layer[keep], cell[keep]
+            ehit, expe = ehit[keep], expe[keep]
 
         if self.train:
             view = self.view_of_layer[layer]                   # per-token view
             if self.aug.get("reflect_x") and np.random.rand() < 0.5:
-                m = view == 0
+                m = view == COMPONENT_VIEWS[0]
                 cell[m] = (N_CELL - 1) - cell[m]
                 concept = concept * self.rx + self.offx
+                angle *= self.arx
+                fit_angle *= self.arx
             if self.aug.get("reflect_y") and np.random.rand() < 0.5:
-                m = view == 1
+                m = view == COMPONENT_VIEWS[1]
                 cell[m] = (N_CELL - 1) - cell[m]
                 concept = concept * self.ry + self.offy
+                angle *= self.ary
+                fit_angle *= self.ary
 
         geo = token_geometry_features(layer, cell, self.table)       # (n,5)
         e_feat = np.log1p(np.clip(ehit, 0, None))[:, None].astype(np.float32)
@@ -121,6 +203,7 @@ class EcalTokens(Dataset):
 
         log_e = (np.log(max(self.energy[i], 1e-3)) - self.log_mean) / self.log_std
         concept_std = (concept - self.cmean) / self.cstd
+        angle_std = (angle - self.amean) / self.astd
 
         return {
             "feats": torch.from_numpy(feats),
@@ -128,8 +211,13 @@ class EcalTokens(Dataset):
             "recon": torch.from_numpy(recon),
             "log_e": torch.tensor(log_e, dtype=torch.float32),
             "energy": torch.tensor(self.energy[i], dtype=torch.float32),
+            "angle": torch.from_numpy(angle.astype(np.float32)),
+            "angle_std": torch.from_numpy(angle_std.astype(np.float32)),
+            "fit_angle": torch.from_numpy(fit_angle.astype(np.float32)),
             "concepts": torch.from_numpy(concept_std.astype(np.float32)),
             "fit_resid": torch.tensor(self.fit_resid[i], dtype=torch.float32),
+            "run": torch.tensor(self.run[i], dtype=torch.long),
+            "event": torch.tensor(self.event[i], dtype=torch.long),
         }
 
 
@@ -154,8 +242,13 @@ def collate(batch):
         "valid": valid,                                  # True = real token
         "log_e": torch.stack([b["log_e"] for b in batch]),
         "energy": torch.stack([b["energy"] for b in batch]),
+        "angle": torch.stack([b["angle"] for b in batch]),
+        "angle_std": torch.stack([b["angle_std"] for b in batch]),
+        "fit_angle": torch.stack([b["fit_angle"] for b in batch]),
         "concepts": torch.stack([b["concepts"] for b in batch]),
         "fit_resid": torch.stack([b["fit_resid"] for b in batch]),
+        "run": torch.stack([b["run"] for b in batch]),
+        "event": torch.stack([b["event"] for b in batch]),
     }
 
 
@@ -233,7 +326,7 @@ def _seed_worker(worker_id):
 
 def make_loader(ds, cfg, shuffle, seed=0):
     """Token-budget DataLoader shared by train / evaluate / probe."""
-    lengths = ds.off[1:] - ds.off[:-1]
+    lengths = (ds.off[1:] - ds.off[:-1])[ds.indices]
     sampler = TokenBudgetBatchSampler(
         lengths,
         max_tokens=cfg.train.get("max_tokens_per_batch", 65536),

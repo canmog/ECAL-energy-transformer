@@ -1,0 +1,39 @@
+#!/bin/bash
+# Build the fixed-10-MeV, no-event-selection cache without holding all tokens in RAM.
+#SBATCH --partition=cpu
+#SBATCH --qos=cpunormal
+#SBATCH --account=ihepai
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
+#SBATCH --time=08:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+
+cd "$SLURM_SUBMIT_DIR" || exit 1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1 || exit 2
+set -euo pipefail
+
+FINAL=/aifs/user/data/lishanglin/chenhao/angleTransformer/cache_all10_uncut
+if [[ -s "$FINAL/meta.json" ]]; then
+  python -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m.get("complete"); assert not any(m["selection"].values()); assert m["threshold_mev"] == 10.0' "$FINAL/meta.json"
+  echo "ALL10_CACHE_REUSE path=$FINAL time=$(date '+%F %T')"
+  exit 0
+fi
+if [[ -e "$FINAL" ]]; then
+  echo "ALL10_CACHE_INCOMPLETE_REFUSE path=$FINAL"
+  exit 5
+fi
+
+STAGE="${FINAL}.build-${SLURM_JOB_ID}"
+echo "ALL10_CACHE_START stage=$STAGE host=$(hostname) time=$(date '+%F %T')"
+python -m data.preprocess_memmap --config config/base.yaml --set \
+  "paths.cache_dir=$STAGE" \
+  seed=42 data.threshold_mev=10.0 data.max_events=null \
+  data.selection.require_truth=false \
+  data.selection.require_angle_truth=false \
+  data.selection.select_contained=false \
+  data.selection.select_single_shower=false \
+  data.selection.require_positive_ref=false \
+  data.selection.pid_electron_only=false
+mv "$STAGE" "$FINAL"
+echo "ALL10_CACHE_OK path=$FINAL time=$(date '+%F %T')"
+
