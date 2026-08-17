@@ -29,6 +29,14 @@
 seed: 42
 device: cuda
 
+# Explicit task contract. The default remains the published energy pipeline:
+# energy is primary; expected-cell reconstruction and shower concepts are
+# auxiliaries. Use config/angle.yaml or config/joint.yaml for direction work.
+task:
+  mode: energy
+  selection: energy
+  auxiliary: [recon, concept]
+
 paths:
   # Merged 50-file dataset (CERN 3dfit + mcinfo pairs -> merge/merge_all.sh).
   # root_file accepts a glob; single-file paths still work.
@@ -112,7 +120,8 @@ model:
   bottleneck_residual: true     # sw_d192: KEEP the `tokens +` skip at the tap (bypass ON)
   dual_energy_head: false       # sw_d192: PLAIN energy head (energy = single deep head)
 
-# Task heads. energy + recon active; the rest are RESERVED registry slots.
+# Task heads. Active heads must agree with task.mode/task.auxiliary; train.py
+# validates this before opening a cache.
 heads:
   energy:   {enabled: true,  hidden: [128]}
   recon:    {enabled: true,  hidden: [128]}   # micro-unit reconstruction of kx_expehit

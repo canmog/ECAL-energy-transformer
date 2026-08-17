@@ -47,6 +47,7 @@ class TrainingModesTest(unittest.TestCase):
             "train.num_workers=0",
             "train.augment={'reflect_x': False, 'reflect_y': False}",
             f"task.mode={mode}",
+            f"task.selection={'angle' if mode in ('angle', 'joint') else 'energy'}",
             "task.auxiliary=[]",
             "loss.fit_quality_weight.enabled=false",
             "loss.angle={'delta': 0.1, 'mode': 'huber'}",
