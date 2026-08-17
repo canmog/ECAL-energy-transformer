@@ -1,0 +1,114 @@
+{
+  "n_concepts": 11,
+  "concept_names": [
+    "shwr_x0",
+    "shwr_y0",
+    "shwr_z0",
+    "shwr_kx",
+    "shwr_ky",
+    "shwr_a0",
+    "frac_lat",
+    "frac_rear",
+    "tmax",
+    "lat_width",
+    "long_width"
+  ],
+  "concept_reflect_x": [
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "concept_reflect_y": [
+    1,
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "concept_coord": [
+    "x",
+    "y",
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "concept_mean": [
+    -0.011238234117627144,
+    -0.01842547208070755,
+    -153.60110473632812,
+    -5.6464745284756646e-05,
+    -8.902240369934589e-05,
+    -139.5726318359375,
+    0.006760376039892435,
+    0.1058439165353775,
+    9.763790130615234,
+    1.684818983078003,
+    3.5873472690582275
+  ],
+  "concept_std": [
+    18.856956481933594,
+    18.933237075805664,
+    2.7377736568450928,
+    0.2856558561325073,
+    0.28613951802253723,
+    1.7590831518173218,
+    0.017854679375886917,
+    0.08917981386184692,
+    1.5068538188934326,
+    0.2818167805671692,
+    0.22326065599918365
+  ],
+  "log_energy_mean": 5.855997562408447,
+  "log_energy_std": 1.3782228231430054,
+  "angle_names": [
+    "mc_kx",
+    "mc_ky"
+  ],
+  "angle_mean": [
+    -3.514148556860164e-05,
+    -0.0001607820304343477
+  ],
+  "angle_std": [
+    0.28637880086898804,
+    0.28680771589279175
+  ],
+  "angle_reflect_x": [
+    -1,
+    1
+  ],
+  "angle_reflect_y": [
+    1,
+    -1
+  ],
+  "threshold_mev": 10.0,
+  "cell_scale": 1000.0,
+  "geometry_data_type": "MC",
+  "selection": {
+    "require_truth": true,
+    "require_angle_truth": true,
+    "select_contained": true,
+    "select_single_shower": true,
+    "require_positive_ref": false,
+    "pid_electron_only": false
+  }
+}

@@ -1,26 +1,68 @@
 #!/usr/bin/env bash
-# End-to-end on the IHEP GPU node (RTX 5090 / CUDA 13).
-# Bring up the node first (see ../aiGPU.md), then from this dir:  bash run.sh
-set -uo pipefail
+# End-to-end IHEP workflow for config/base.yaml, angle.yaml, or joint.yaml.
+set -euo pipefail
 
-# 1. CUDA-13 conda env (torch 2.9 + cu130, sm_120; uproot/awkward/numpy/sklearn).
 source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh
-python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())" || exit 1
-set -e
-
+cd /aifs/user/data/lishanglin/chenhao/ecalTransformer
 CFG=${1:-config/base.yaml}
 
-# 2. Sanity-check the ROOT branches / units (run once).
-python -m data.inspect_root --config "$CFG"
+readarray -t SETTINGS < <(python - "$CFG" <<'PY'
+import sys
+from utils.config import load_config
+from utils.tasks import task_mode
+cfg, _ = load_config(sys.argv[1])
+print(task_mode(cfg))
+print(cfg.paths.cache_dir)
+print(cfg.paths.out_dir)
+PY
+)
+MODE=${SETTINGS[0]}
+CACHE=${SETTINGS[1]}
+OUTPUT=${SETTINGS[2]}
 
-# 3. ROOT -> tokenised cache + concept/energy targets + meta.json.
-python -m data.preprocess --config "$CFG"
+python -m unittest discover -s tests -v
+python -m data.geometry
 
-# 4. Train (energy + recon + concept, uncertainty-weighted; bias-aware early stop).
+cache_complete=true
+for split in train val test; do
+  if [[ ! -f "$CACHE/$split.npz" && ! -d "$CACHE/$split" ]]; then
+    cache_complete=false
+  fi
+done
+if [[ ! -f "$CACHE/meta.json" ]]; then
+  cache_complete=false
+fi
+if [[ "$cache_complete" != true ]]; then
+  python -m data.inspect_root --config "$CFG"
+  python -m data.preprocess --config "$CFG"
+fi
+
 python train.py --config "$CFG"
+case "$MODE" in
+  energy)
+    python evaluate.py --config "$CFG"
+    python probe.py --config "$CFG"
+    ;;
+  angle)
+    python evaluate_angle.py --config "$CFG"
+    python evaluate_centroid.py --config "$CFG" --weight-power 1.5
+    python probe_angle.py --config "$CFG"
+    ;;
+  joint)
+    mkdir -p "$OUTPUT/eval_best_angle" "$OUTPUT/eval_best_energy"
+    python evaluate_angle.py --config "$CFG" --ckpt "$OUTPUT/best_angle.pt" \
+      --set "paths.out_dir=$OUTPUT/eval_best_angle"
+    python evaluate_angle.py --config "$CFG" --ckpt "$OUTPUT/best_energy.pt" \
+      --set "paths.out_dir=$OUTPUT/eval_best_energy"
+    ;;
+  *)
+    echo "unsupported training mode: $MODE" >&2
+    exit 2
+    ;;
+esac
 
-# 5. Evaluate (sigma/E & bias vs E, concept R^2, plots).
-python evaluate.py --config "$CFG"
-
-# 6. Physics-probe battery (linear probe / ablation / mirror).
-python probe.py --config "$CFG"
+if [[ "$MODE" != energy ]]; then
+  # This deployment export intentionally does not request MC truth or 3D fit.
+  python export_predictions.py --config "$CFG"
+fi
+echo "ECAL_TASK_OK mode=$MODE output=$OUTPUT"

@@ -1,0 +1,33 @@
+#!/bin/bash
+#SBATCH --job-name=ecal_angle
+#SBATCH --partition=gpu
+#SBATCH --qos=gpunormal
+#SBATCH --account=ihepai
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
+#SBATCH --time=1-00:00:00
+#SBATCH --output=runs/slurm-%x-%j.out
+
+set -euo pipefail
+cd "$SLURM_SUBMIT_DIR"
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+CFG=config/angle.yaml
+OUTPUT=runs/angle_d192_seed73111
+mkdir -p "$OUTPUT"
+python -c "import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.cuda.get_device_name(0))"
+python -m unittest discover -s tests -v
+python train.py --config "$CFG" --set "paths.out_dir=$OUTPUT" \
+  "train.num_workers=$SLURM_CPUS_PER_TASK" 2>&1 | tee "$OUTPUT/train.log"
+python evaluate_angle.py --config "$CFG" --ckpt "$OUTPUT/best.pt" \
+  --set "paths.out_dir=$OUTPUT" "train.num_workers=$SLURM_CPUS_PER_TASK" \
+  2>&1 | tee "$OUTPUT/evaluate.log"
+python probe_angle.py --config "$CFG" --ckpt "$OUTPUT/best.pt" \
+  --set "paths.out_dir=$OUTPUT" "train.num_workers=$SLURM_CPUS_PER_TASK" \
+  2>&1 | tee "$OUTPUT/probe.log"
+python export_predictions.py --config "$CFG" --ckpt "$OUTPUT/best.pt" \
+  --set "paths.out_dir=$OUTPUT" "train.num_workers=$SLURM_CPUS_PER_TASK" \
+  2>&1 | tee "$OUTPUT/export.log"
+echo "ECAL_ANGLE_OK output=$OUTPUT"

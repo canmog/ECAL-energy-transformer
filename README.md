@@ -1,4 +1,40 @@
-# transformer_v3 — Gaussian-core selection & evaluation
+# ECAL Transformer — energy and incidence-direction reconstruction
+
+This repository now supports three explicit training modes with one sparse-token
+Transformer implementation:
+
+| profile | primary reconstruction | default auxiliaries | primary checkpoint |
+|---|---|---|---|
+| `config/base.yaml` | energy | expected cells, concepts | energy composite |
+| `config/angle.yaml` | MC `(kx,ky)` | energy, expected cells, concepts | angular p68 |
+| `config/joint.yaml` | energy and MC `(kx,ky)` | expected cells, concepts | configured selection, plus independent best-energy/best-angle files |
+
+Training validates the complete configuration and both cache splits before the
+first batch. Missing inputs, targets, normalization metadata, or enabled heads
+raise a field-specific error; no zero-valued targets are synthesized. Existing
+packed NPZ energy caches remain supported, and the same dataset interface also
+opens split memory-mapped NPY caches.
+
+The direction projection convention is physically fixed as stored view 1 to
+X/`kx` and stored view 0 to Y/`ky` (`component_views: [1, 0]`). See
+[`docs/ANGLE_RECONSTRUCTION.md`](docs/ANGLE_RECONSTRUCTION.md) for the selected
+results, commands, inference contract, and provenance.
+
+Typical IHEP commands:
+
+```bash
+python train.py --config config/angle.yaml
+python evaluate_angle.py --config config/angle.yaml
+python export_predictions.py --config config/angle.yaml   # no MC truth required
+
+python train.py --config config/joint.yaml
+```
+
+`bash run.sh <config>` dispatches the matching end-to-end workflow. Production
+SLURM templates are `job_angle_d192_integrated.sub` and
+`job_joint_d192_integrated.sub`.
+
+## Energy v3 — Gaussian-core selection and evaluation
 
 Fork of `transformer_v2cham` (the champion: wdx + v2m1 fit-quality weighting on the
 `sw_d192` model). The trained objective is UNCHANGED; v3 changes the **resolution
