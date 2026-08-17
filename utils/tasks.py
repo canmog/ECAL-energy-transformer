@@ -28,6 +28,10 @@ def active_tasks(cfg):
     task = cfg.get("task", None)
     auxiliary = (task.get("auxiliary", list(DEFAULT_AUXILIARY[mode]))
                  if task else list(DEFAULT_AUXILIARY[mode]))
+    if isinstance(auxiliary, str):
+        raise ValueError(
+            "task.auxiliary must be a YAML list, for example [recon, concept], "
+            "not a string")
     auxiliary = list(auxiliary or [])
     unknown = sorted(set(auxiliary) - ALLOWED_TASKS)
     if unknown:
@@ -57,13 +61,48 @@ def active_tasks(cfg):
 def validate_task_heads(cfg, tasks=None):
     tasks = tuple(tasks or active_tasks(cfg))
     for name in ("energy", "angle", "recon"):
-        if name in tasks and not getattr(cfg.heads, name).enabled:
+        if name not in tasks:
+            continue
+        head = cfg.heads.get(name, None)
+        if head is None:
+            raise ValueError(
+                f"task {name!r} is active but required config section "
+                f"heads.{name} is missing")
+        if not head.get("enabled", False):
             raise ValueError(
                 f"task {name!r} is active but heads.{name}.enabled is false")
     return tasks
 
 
-def cache_fields_for_tasks(tasks, *, fit_quality=False):
+def validate_training_contract(cfg):
+    """Validate every config capability consumed by training before data loading."""
+    mode = task_mode(cfg)
+    tasks = validate_task_heads(cfg)
+    for name in tasks:
+        section = cfg.loss.get(name, None)
+        if section is None:
+            raise ValueError(
+                f"task {name!r} is active but required config section "
+                f"loss.{name} is missing")
+        if section.get("delta", None) is None:
+            raise ValueError(
+                f"task {name!r} is active but required config field "
+                f"loss.{name}.delta is missing")
+
+    task = cfg.get("task", None)
+    selection = (task.get("selection", "angle" if mode == "joint" else mode)
+                 if task else mode)
+    if selection not in ("energy", "angle"):
+        raise ValueError(
+            f"task.selection={selection!r} is invalid; expected 'energy' or 'angle'")
+    if selection not in tasks:
+        raise ValueError(
+            f"task.selection={selection!r} is not one of the active tasks {tasks}")
+    return mode, tasks, selection
+
+
+def cache_fields_for_tasks(tasks, *, fit_quality=False,
+                           angle_energy_weight=False):
     fields = set()
     if "energy" in tasks:
         fields.add("energy")
@@ -75,4 +114,6 @@ def cache_fields_for_tasks(tasks, *, fit_quality=False):
         fields.add("concepts")
     if fit_quality:
         fields.add("tok_expe")
+    if angle_energy_weight:
+        fields.add("energy")
     return frozenset(fields)

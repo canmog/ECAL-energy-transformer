@@ -59,11 +59,22 @@ class EcalTokens(Dataset):
         self.train = train
         self.aug = augment or {}
         z, self.available_fields = _load_split(cache_dir, split)
-        required = set(required_fields_for(
-            task_mode if include_targets else "predict",
-            require_fit_angle=require_fit_angle,
-            require_identity=require_identity))
-        required.update(required_fields or ())
+        # No explicit contract means legacy behavior: energy mode loads the
+        # complete historical energy/reconstruction/concept target bundle.
+        # Entry points that know their active losses pass ``required_fields``;
+        # for them this is the exact contract, not an addition to that legacy
+        # bundle.  This is what lets energy-only, angle-only, and joint jobs fail
+        # early on precisely the fields they consume.
+        if required_fields is None:
+            required = set(required_fields_for(
+                task_mode if include_targets else "predict",
+                require_fit_angle=require_fit_angle,
+                require_identity=require_identity))
+        else:
+            required = set(required_fields_for(
+                "predict", require_fit_angle=require_fit_angle,
+                require_identity=require_identity))
+            required.update(required_fields)
         if compute_fit_resid is None:
             compute_fit_resid = include_targets and task_mode in ("energy", "joint")
         if compute_fit_resid:
