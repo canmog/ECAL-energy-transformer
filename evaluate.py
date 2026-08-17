@@ -24,7 +24,9 @@ sys.path.insert(0, ".")
 from utils.config import load_config
 from utils.stats import gauss_core, robust_sigma
 from data.dataset import EcalTokens, load_meta, make_loader
+from data.schema import require_meta
 from models.model import EcalTransformer
+from utils.tasks import cache_fields_for_tasks, validate_training_contract
 
 
 def amp_dtype_of(cfg):
@@ -39,7 +41,7 @@ def amp_dtype_of(cfg):
 
 
 @torch.no_grad()
-def run_model(model, loader, device, amp_dtype):
+def run_model(model, loader, device, amp_dtype, tasks):
     ep, et, cp, ct, rerr = [], [], [], [], []
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -47,13 +49,21 @@ def run_model(model, loader, device, amp_dtype):
             out = model(batch)
         ep.append(model.predict_energy_gev(out["energy"].float()).cpu().numpy())
         et.append(batch["energy"].cpu().numpy())
-        cp.append(out["concepts"].float().cpu().numpy())
-        ct.append(batch["concepts"].cpu().numpy())
-        v = batch["valid"]
-        e = ((out["recon"].float() - batch["recon"]) ** 2 * v).sum(1) / v.sum(1).clamp_min(1)
-        rerr.append(e.cpu().numpy())
-    return (np.concatenate(ep), np.concatenate(et), np.concatenate(cp),
-            np.concatenate(ct), np.concatenate(rerr))
+        if "concept" in tasks:
+            cp.append(out["concepts"].float().cpu().numpy())
+            ct.append(batch["concepts"].cpu().numpy())
+        if "recon" in tasks:
+            valid = batch["valid"]
+            error = ((out["recon"].float() - batch["recon"]) ** 2 * valid).sum(1)
+            error = error / valid.sum(1).clamp_min(1)
+            rerr.append(error.cpu().numpy())
+    result = {"energy_pred": np.concatenate(ep), "energy_true": np.concatenate(et)}
+    if cp:
+        result["concept_pred"] = np.concatenate(cp)
+        result["concept_true"] = np.concatenate(ct)
+    if rerr:
+        result["recon_mse"] = np.concatenate(rerr)
+    return result
 
 
 def binned(e_true, r, bins):
@@ -86,34 +96,66 @@ def main():
     ap.add_argument("--ckpt", default=None)
     args = ap.parse_args()
     cfg, _ = load_config(args.config, args.overrides)
+    mode, tasks, _ = validate_training_contract(cfg)
+    if "energy" not in tasks:
+        raise ValueError(
+            f"evaluate.py requires an active energy task; active tasks are {tasks}. "
+            "Use evaluate_angle.py for direction scoring.")
     device = cfg.device
-    meta = load_meta(cfg.paths.cache_dir)
+    cache_meta = load_meta(cfg.paths.cache_dir)
     ckpt_path = args.ckpt or os.path.join(cfg.paths.out_dir, "best.pt")
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    meta = checkpoint.get("meta", cache_meta)
+    require_meta(meta, ("n_concepts", "geometry_data_type", "log_energy_mean",
+                        "log_energy_std"), cache_dir=ckpt_path,
+                 operation="energy checkpoint loading")
+    require_meta(cache_meta, ("geometry_data_type",), cache_dir=cfg.paths.cache_dir,
+                 operation="energy evaluation")
+    if meta["geometry_data_type"] != cache_meta["geometry_data_type"]:
+        raise ValueError("checkpoint and evaluation cache geometries differ")
+    if "concept" in tasks:
+        require_meta(meta, ("concept_names", "concept_mean", "concept_std"),
+                     cache_dir=ckpt_path, operation="concept evaluation")
+        require_meta(cache_meta, ("concept_names",), cache_dir=cfg.paths.cache_dir,
+                     operation="concept evaluation")
+        if list(meta["concept_names"]) != list(cache_meta["concept_names"]):
+            raise ValueError("checkpoint and evaluation cache concept schemas differ")
 
     concept_use = cfg.data.get("concept_use", None)
     n_concepts = len(concept_use) if concept_use else meta["n_concepts"]
     model = EcalTransformer(cfg, n_concepts).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device)["model"])
+    model.set_energy_norm(meta["log_energy_mean"], meta["log_energy_std"])
+    model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 
-    test_ds = EcalTokens(cfg.paths.cache_dir, "test", meta, concept_use=concept_use)
+    eval_tasks = tuple(name for name in tasks if name in ("energy", "recon", "concept"))
+    required = cache_fields_for_tasks(eval_tasks)
+    test_ds = EcalTokens(
+        cfg.paths.cache_dir, "test", meta, concept_use=concept_use,
+        threshold_mev=cfg.data.get("runtime_threshold_mev", None),
+        max_events=cfg.data.get("eval_max_events", None), subset_seed=cfg.seed + 2,
+        task_mode=mode, required_fields=required, compute_fit_resid=False,
+        operation="energy MC evaluation")
     loader = make_loader(test_ds, cfg, shuffle=False)
-    e_pred, e_true, c_pred, c_true, rerr = run_model(model, loader, device, amp_dtype_of(cfg))
+    arrays = run_model(model, loader, device, amp_dtype_of(cfg), eval_tasks)
+    e_pred, e_true = arrays["energy_pred"], arrays["energy_true"]
     r = (e_pred - e_true) / np.clip(e_true, 1e-3, None)
 
     bins = np.array(cfg.eval.energy_bins, dtype=float)
     b = binned(e_true, r, bins)
 
     # per-concept resolution (de-standardise to raw 3D-fit units; subset-aware)
-    cstd = np.asarray(test_ds.cstd); cmean = np.asarray(test_ds.cmean)
-    cp_raw = c_pred * cstd + cmean
-    ct_raw = c_true * cstd + cmean
     concept_metrics = {}
-    for j, name in enumerate(test_ds.concept_names):
-        var = np.var(ct_raw[:, j]) + 1e-9
-        r2 = 1.0 - np.mean((cp_raw[:, j] - ct_raw[:, j]) ** 2) / var
-        concept_metrics[name] = {"rmse": float(np.sqrt(np.mean((cp_raw[:, j]-ct_raw[:, j])**2))),
-                                 "r2": float(r2)}
+    if "concept" in eval_tasks:
+        cstd = np.asarray(test_ds.cstd)
+        cmean = np.asarray(test_ds.cmean)
+        cp_raw = arrays["concept_pred"] * cstd + cmean
+        ct_raw = arrays["concept_true"] * cstd + cmean
+        for j, name in enumerate(test_ds.concept_names):
+            mse = np.mean((cp_raw[:, j] - ct_raw[:, j]) ** 2)
+            var = np.var(ct_raw[:, j]) + 1e-9
+            concept_metrics[name] = {
+                "rmse": float(np.sqrt(mse)), "r2": float(1.0 - mse / var)}
 
     # Reliable-range summary: the ECAL can't measure electrons past ~2 TeV (rear
     # leakage), so report sigma/E restricted to <= e_cut alongside the full range.
@@ -148,19 +190,26 @@ def main():
         "overall_res_le_cut_raw_std": float(np.std(r[m2])) if m2.any() else None,
         "outlier_frac": float(np.mean(np.abs(r) > 0.20)),
         "e_cut_gev": e_cut,
-        "recon_logmse": float(np.mean(rerr)),
         "bins": {k: v.tolist() for k, v in b.items()},
-        "concepts": concept_metrics,
     }
+    if "recon_mse" in arrays:
+        metrics["recon_logmse"] = float(np.mean(arrays["recon_mse"]))
+    if concept_metrics:
+        metrics["concepts"] = concept_metrics
     with open(os.path.join(cfg.paths.out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-    print(json.dumps({k: metrics[k] for k in
-          ["overall_res_gauss", "overall_bias_gauss", "overall_res_gauss_le_cut",
-           "binwise_mean_res_gauss", "overall_res", "overall_res_le_cut",
-           "overall_res_raw_std", "outlier_frac", "recon_logmse"]}, indent=2))
+    headline_keys = [
+        "overall_res_gauss", "overall_bias_gauss", "overall_res_gauss_le_cut",
+        "binwise_mean_res_gauss", "overall_res", "overall_res_le_cut",
+        "overall_res_raw_std", "outlier_frac"]
+    if "recon_logmse" in metrics:
+        headline_keys.append("recon_logmse")
+    print(json.dumps({key: metrics[key] for key in headline_keys}, indent=2))
     print("(overall_res_gauss = Gaussian core, iterative +/-2sigma fit; "
           "overall_res = robust core IQR/1.349; overall_res_raw_std = legacy std)")
-    print("concept R^2:", {k: round(v["r2"], 3) for k, v in concept_metrics.items()})
+    if concept_metrics:
+        print("concept R^2:", {
+            key: round(value["r2"], 3) for key, value in concept_metrics.items()})
 
     od = cfg.paths.out_dir
     plt.figure()

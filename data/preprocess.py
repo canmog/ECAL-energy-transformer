@@ -31,6 +31,8 @@ from utils.config import load_config  # noqa: E402
 from data.geometry import (COMPONENT_VIEWS, N_LAYER, N_CELL,
                            build_geometry_table)  # noqa: E402
 from data.schema import CACHE_SCHEMA_VERSION, normalize_task_mode  # noqa: E402
+from data.root_schema import (required_root_branches,
+                              require_root_branches)  # noqa: E402
 
 
 def _as_3d(arr):
@@ -117,7 +119,6 @@ def main():
         raise ValueError("data.angle_branches must contain exactly two slope branches")
     if has_fit_angle and len(fit_angle_branches) != 2:
         raise ValueError("data.fit_angle_branches must contain exactly two slope branches")
-    os.makedirs(cfg.paths.cache_dir, exist_ok=True)
     table = build_geometry_table(cfg.geometry.data_type)   # for derived shape concepts
 
     concept_names = [c.name for c in d.concepts]
@@ -136,6 +137,10 @@ def main():
     paths = sorted(globmod.glob(cfg.paths.root_file))
     if not paths:
         raise FileNotFoundError(f"no ROOT files match {cfg.paths.root_file!r}")
+    require_root_branches(
+        paths, cfg.paths.tree, required_root_branches(cfg),
+        operation=f"{task_mode} cache preprocessing")
+    os.makedirs(cfg.paths.cache_dir, exist_ok=True)
     print(f"reading {len(paths)} input file(s)")
 
     tok_layer, tok_cell, tok_ehit, tok_expe = [], [], [], []

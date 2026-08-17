@@ -10,6 +10,8 @@ import uproot
 
 sys.path.insert(0, ".")
 from utils.config import load_config  # noqa: E402
+from data.root_schema import (required_root_branches,
+                              require_root_branches)  # noqa: E402
 
 
 def main():
@@ -23,18 +25,18 @@ def main():
     paths = sorted(globmod.glob(cfg.paths.root_file))
     if not paths:
         raise FileNotFoundError(f"no ROOT files match {cfg.paths.root_file!r}")
+    needed = sorted(required_root_branches(cfg))
+    require_root_branches(
+        paths, cfg.paths.tree, needed, operation="ROOT input inspection")
     print(f"{len(paths)} file(s) match; inspecting the first: {paths[0]}")
     f = uproot.open(paths[0])
     tree = f[cfg.paths.tree]
     print(f"tree={cfg.paths.tree}  n_entries={tree.num_entries} (first file only)")
 
-    needed = [cfg.data.ehit_branch, cfg.data.expehit_branch, cfg.data.target_branch,
-              cfg.data.stat_branch, cfg.data.nshwr_branch, cfg.data.ref_branch]
-    needed += [c.branch for c in cfg.data.concepts if c.get("branch")]
     have = set(tree.keys())
     print("\n-- branch presence --")
     for b in needed:
-        print(f"  {'OK ' if b in have else 'MISSING'}  {b}")
+        print(f"  OK   {b}")
 
     n = min(5000, tree.num_entries)
     arrs = tree.arrays([cfg.data.ehit_branch, cfg.data.expehit_branch,
