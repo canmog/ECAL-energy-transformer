@@ -53,4 +53,3 @@ def require_root_branches(paths, tree_name, required, operation="ROOT preprocess
                     f"{operation} cannot use ROOT tree {tree_name!r} in {path!r}: "
                     f"missing required branch(es) {missing}; configured branches "
                     "must be present in every input file")
-
