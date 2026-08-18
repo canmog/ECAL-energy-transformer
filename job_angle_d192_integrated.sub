@@ -9,9 +9,9 @@
 #SBATCH --time=1-00:00:00
 #SBATCH --output=runs/slurm-%x-%j.out
 
-set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
-source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1
+source /aifs/user/home/lishanglin/HREDML/loadCondaEnvCuda13.sh >/dev/null 2>&1 || exit 2
+set -euo pipefail
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 CFG=config/angle.yaml
